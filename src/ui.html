@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asqu</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --surface: #ffffff; --ink: #1b1a17; --muted: #6a665e; --line: #e4e1d9;
+    --accent: #2f5bd3; --accent-ink: #ffffff; --accent-soft: #e9eefc;
+    --good: #2e7d4f; --good-soft: #e5f3ea; --warn: #9a6400; --warn-soft: #fbf0d9;
+    --bad: #b23a3a; --bad-soft: #f8e4e4; --star: #b07a00;
+    --good-ink: #276b43;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --surface: #1c1b19; --ink: #ecebe6; --muted: #a29e95; --line: #312f2b;
+      --accent: #8aa8ff; --accent-ink: #10131c; --accent-soft: #1e2740;
+      --good: #7fd1a0; --good-soft: #17291f; --warn: #f0c060; --warn-soft: #2e2512;
+      --bad: #f08a8a; --bad-soft: #331a1a; --star: #f0c060;
+      --good-ink: var(--good);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 28px 16px 80px; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; justify-content: space-between; margin-bottom: 20px; }
+  .brand { font-weight: 800; font-size: 26px; letter-spacing: -.02em; }
+  .brand small { font-weight: 500; font-size: 14px; color: var(--muted); margin-left: 8px; letter-spacing: 0; }
+  .digest { color: var(--muted); margin-top: 2px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { font: inherit; border-radius: 999px; border: 1px solid var(--muted); background: var(--surface);
+    color: var(--ink); padding: 7px 14px; cursor: pointer; }
+  button:hover { border-color: var(--ink); }
+  button:focus-visible, select:focus-visible, input:focus-visible, .field:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--ink); outline-offset: 2px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  section { margin-top: 26px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+  .ask { display: flex; gap: 8px; padding: 10px; }
+  .welcome { padding: 16px 18px; margin-bottom: 14px; line-height: 1.6; }
+  .welcome ul { margin: 8px 0 0; padding-left: 20px; }
+  .welcome code { font: 13px ui-monospace, Menlo, monospace; }
+  .ask input { flex: 1; min-width: 0; font: inherit; border: none; background: transparent; color: var(--ink); padding: 6px 8px; outline: none; }
+  .question { padding: 14px 16px; border-left: 4px solid var(--warn); margin-bottom: 10px; }
+  .question p { margin: 0 0 10px; }
+  .question .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row { padding: 12px 16px; border-top: 1px solid var(--line); }
+  .row:first-child { border-top: none; }
+  .row-head { display: flex; gap: 12px; align-items: baseline; cursor: pointer; }
+  .num { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 34px; }
+  .what { flex: 1; min-width: 0; }
+  .why { color: var(--muted); font-style: italic; }
+  .meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .star { color: var(--star); font-weight: 600; font-size: 13px; margin-left: 6px; }
+  .detail { margin: 10px 0 0 46px; }
+  .detail ul { margin: 0 0 10px; padding: 0; list-style: none; font: 13px/1.6 ui-monospace, Menlo, monospace; }
+  .k-add { color: var(--good); } .k-delete { color: var(--bad); } .k-modify { color: var(--warn); }
+  .try { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--line); }
+  .try:first-child { border-top: none; }
+  .try .what { flex: 1 1 260px; }
+  .try .what b { display: block; }
+  .count { color: var(--muted); font-size: 13px; }
+  #switch { font: inherit; font-size: 14px; color: var(--muted); background: transparent; border: 1px solid var(--line);
+    border-radius: 8px; padding: 2px 6px; margin-left: 8px; max-width: 220px; }
+  .proj { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--line); cursor: pointer; }
+  .proj:first-child { border-top: none; }
+  .proj:hover { background: var(--accent-soft); }
+  .proj .what { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .proj .here { color: var(--accent); font-size: 12px; margin-left: 6px; }
+  .backups { padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .backup { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .backup .what { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .backup.bad .what { color: var(--bad); }
+  .backups .none { color: var(--muted); }
+  .places { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; }
+  .places button { text-align: left; border-radius: 10px; }
+  .places button.on { border-color: var(--accent); background: var(--accent-soft); }
+  .places small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+  .field { width: 100%; box-sizing: border-box; font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; margin-top: 6px; }
+  .path { font: 12px ui-monospace, Menlo, monospace; color: var(--muted); word-break: break-all; }
+  .empty { padding: 16px; color: var(--muted); }
+  .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--ink); color: var(--bg);
+    padding: 10px 16px; border-radius: 999px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 90vw; }
+  .toast.show { opacity: 1; }
+  dialog { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--ink);
+    max-width: 520px; width: calc(100% - 32px); padding: 20px; }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog h3 { margin: 0 0 8px; }
+  dialog ul { padding-left: 18px; max-height: 240px; overflow: auto; font: 13px/1.6 ui-monospace, Menlo, monospace; }
+  dialog .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  .section-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .section-head h2 { margin: 0; }
+  #tries:not([hidden]) + #compare-result { margin-top: 10px; }
+  .rank { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--line); }
+  .rank:first-child { border-top: none; }
+  .rank .what { flex: 1 1 260px; min-width: 0; }
+  .rank .pos { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 22px; }
+  .badge { display: inline-block; font-size: 12px; font-weight: 600; border-radius: 999px; padding: 1px 8px; margin-left: 8px;
+    background: var(--good-soft); color: var(--good-ink); vertical-align: 1px; }
+  .facts { color: var(--muted); font-size: 13px; }
+  .facts .bad { color: var(--bad); }
+  .note { padding: 10px 16px; border-top: 1px solid var(--line); font-size: 14px; }
+  .note.decider { background: var(--accent-soft); }
+  pre.out { margin: 6px 0 0; font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere;
+    border-left: 2px solid var(--bad); padding-left: 8px; }
+  .waiting { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .clash-file { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+  .clash-file:first-of-type { border-top: none; padding-top: 0; margin-top: 4px; }
+  .clash-file .file { font: 600 14px ui-monospace, Menlo, monospace; overflow-wrap: anywhere; margin: 0; }
+  .clash-file .said { color: var(--muted); font-size: 14px; margin: 2px 0 8px; }
+  .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+  .side { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-width: 0; }
+  .side h4 { margin: 0; padding: 4px 10px; font-size: 12px; font-weight: 600; color: var(--muted); background: var(--bg); border-bottom: 1px solid var(--line); }
+  .side pre { margin: 0; padding: 8px 10px; font: 12px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; }
+  .side.none pre { color: var(--muted); font-style: italic; }
+  pre.out.cmd { border-left-color: var(--warn); color: var(--ink); }
+  .choice { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+  .choice button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .question .btns.end { margin-top: 14px; }
+  @media (max-width: 560px) { .meta { display: none; } .detail { margin-left: 0; } .sides { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="brand">Asqu<small id="project"></small><select id="switch" hidden aria-label="Project"></select></div>
+      <div class="digest" id="digest">Loading…</div>
+    </div>
+    <div class="actions">
+      <button id="undo" class="primary">Undo last change</button>
+      <button id="mark">Mark milestone</button>
+    </div>
+  </header>
+
+  <section id="welcome" class="card welcome" hidden>
+    <b>Welcome to Asqu.</b> This page shows your project's history. While <code>asqu open</code> is running,
+    every change in this folder is saved here by itself, with what changed and why.
+    <ul>
+      <li><b>Undo</b> any change, or click one to see its files and go back to it.</li>
+      <li>Type what you're working on below, and your next changes are labelled with it.</li>
+      <li>Using an AI? Run <code>asqu setup</code> in this folder so it records your requests too.</li>
+    </ul>
+  </section>
+
+  <section id="all" hidden>
+    <h2>All projects</h2>
+    <div class="card" id="all-list"><div class="empty">Loading…</div></div>
+  </section>
+
+  <div id="one">
+  <form class="card ask" id="ask">
+    <input id="ask-input" placeholder="What are you working on? (saved as the reason for your next change)" autocomplete="off">
+    <button type="submit">Save reason</button>
+  </form>
+
+  <section id="questions-wrap" hidden>
+    <h2>Questions for you</h2>
+    <div id="questions"></div>
+  </section>
+
+  <section id="tries-wrap" hidden>
+    <div class="section-head">
+      <h2 id="tries-heading" tabindex="-1">Tries</h2>
+      <button id="compare" hidden>Compare</button>
+    </div>
+    <div class="card" id="tries"></div>
+    <div class="card" id="compare-result" hidden></div>
+  </section>
+
+  <section>
+    <h2>Backups</h2>
+    <div class="card backups" id="backups"><div class="none">Loading…</div></div>
+  </section>
+
+  <section>
+    <h2 id="timeline-heading" tabindex="-1">Timeline</h2>
+    <div class="card" id="timeline"><div class="empty">Loading…</div></div>
+  </section>
+  </div>
+</main>
+
+<dialog id="dlg" aria-labelledby="dlg-title">
+  <h3 id="dlg-title"></h3>
+  <div id="dlg-body"></div>
+  <div class="btns">
+    <button id="dlg-cancel">Cancel</button>
+    <button id="dlg-ok" class="primary">OK</button>
+  </div>
+</dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div id="sr-status" class="sr-only" role="status" aria-live="polite"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+  }
+  for (const kid of kids) if (kid != null) n.append(kid);
+  return n;
+};
+
+// The person's secret comes from the address `asqu open` opened (after #). It lets this
+// page approve things an AI can't. Kept for this tab only, and removed from the address bar.
+const PERSON = (() => {
+  const fromLink = new URLSearchParams(location.hash.slice(1)).get("person");
+  try {
+    if (fromLink) { sessionStorage.setItem("asqu-person", fromLink); history.replaceState(null, "", location.pathname); }
+    return fromLink || sessionStorage.getItem("asqu-person");
+  } catch { return fromLink; }
+})();
+
+// Which project the page shows: "" = the one `asqu open` was run in, "*" = all projects.
+let PROJECT = (() => { try { return sessionStorage.getItem("asqu-project") || ""; } catch { return ""; } })();
+function setProject(id) {
+  PROJECT = id;
+  try { sessionStorage.setItem("asqu-project", id); } catch {}
+  questions.clear();
+  refresh();
+}
+
+async function api(path, body) {
+  if (PROJECT && PROJECT !== "*") path += (path.includes("?") ? "&" : "?") + "project=" + encodeURIComponent(PROJECT);
+  const headers = { "X-Asqu": "1", "Content-Type": "application/json" };
+  if (PERSON) headers["X-Asqu-Person"] = PERSON; // also the page's key to the API
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Something went wrong");
+  return data;
+}
+const call = (tool, args = {}) => api("/call/" + tool, args);
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = ""; t.classList.add("show");
+  setTimeout(() => { t.textContent = msg; }, 50); // cleared first, so a repeated message is read out again
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("show"), 3500);
+}
+
+// Tells screen-reader users what just happened, without anything showing on screen.
+function say(msg) {
+  const s = $("sr-status"); s.textContent = "";
+  setTimeout(() => { s.textContent = msg; }, 50);
+}
+
+const plural = (n, word, many = word + "s") => n === 1 ? `1 ${word}` : `${n} ${many}`;
+const reduceMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function ago(iso) {
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + " min ago";
+  if (s < 86400) return Math.floor(s / 3600) + " h ago";
+  return new Date(iso).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+}
+
+// Asks the person to confirm. Resolves true/false. Pauses refresh while open.
+let dialogOpen = false;
+function confirmBox(title, body, okText = "OK") {
+  return new Promise((resolve) => {
+    const d = $("dlg"); $("dlg-title").textContent = title;
+    $("dlg-body").replaceChildren(...(Array.isArray(body) ? body : [body]));
+    $("dlg-ok").textContent = okText;
+    const done = (v) => { d.close(); dialogOpen = false; resolve(v); };
+    $("dlg-ok").onclick = () => done(true); $("dlg-cancel").onclick = () => done(false);
+    d.oncancel = () => { dialogOpen = false; resolve(false); };
+    dialogOpen = true; d.showModal();
+  });
+}
+
+function fileList(would) {
+  const ul = el("ul");
+  for (const p of would.bring_back) ul.append(el("li", { class: "k-add" }, "bring back  " + p));
+  for (const p of would.restore) ul.append(el("li", { class: "k-modify" }, "restore     " + p));
+  for (const p of would.remove) ul.append(el("li", { class: "k-delete" }, "remove      " + p));
+  if (!ul.children.length) ul.append(el("li", {}, "nothing (files already match)"));
+  return ul;
+}
+
+async function goBack(when, label) {
+  try {
+    const preview = await call("asqu_back", { when, dry_run: true });
+    const ok = await confirmBox("Go back to " + label + "?",
+      [el("p", {}, "This will:"), fileList(preview.would), el("p", {}, "Nothing is lost: you can undo this too.")], "Go back");
+    if (!ok) return;
+    const r = await call("asqu_back", { when });
+    toast(r.saved_as ? `Went back to #${r.went_back_to}. Saved as #${r.saved_as}.` : "Already matched. Nothing to do.");
+    refresh();
+  } catch (e) { toast(e.message); }
+}
+
+const expanded = new Set();
+async function toggleDetail(row, seq) {
+  const existing = row.querySelector(".detail");
+  if (existing) { existing.remove(); expanded.delete(seq); return; }
+  expanded.add(seq);
+  const box = el("div", { class: "detail" }, "Loading…");
+  row.append(box);
+  try {
+    const d = await call("asqu_show", { seq });
+    const ul = el("ul");
+    for (const f of d.files) {
+      const word = f.change === "add" ? "added  " : f.change === "delete" ? "removed" : "changed";
+      ul.append(el("li", { class: "k-" + f.change }, word + "  " + f.path));
+    }
+    box.replaceChildren(ul, el("button", { onclick: () => goBack("#" + seq, "#" + seq) }, "Go back to here"));
+  } catch (e) { box.textContent = e.message; }
+}
+
+function renderTimeline(entries) {
+  const box = $("timeline");
+  if (!entries.length) { box.replaceChildren(el("div", { class: "empty" }, "No history yet. Edit any file in this folder and it appears here within a few seconds.")); return; }
+  box.replaceChildren(...entries.map((e) => {
+    const who = e.agent ? `${e.by} via ${e.agent}` : e.by;
+    const headline = el("div", {}, e.what || e.why || "Change", ...e.milestones.map((m) => el("span", { class: "star" }, "★ " + m)));
+    const what = el("div", { class: "what" }, headline, e.why && e.what ? el("div", { class: "why" }, "“" + e.why + "”") : null);
+    const row = el("div", { class: "row" },
+      el("div", { class: "row-head", onclick: () => toggleDetail(row, e.seq) },
+        el("span", { class: "num" }, "#" + e.seq), what, el("span", { class: "meta" }, who + " · " + ago(e.when))));
+    if (expanded.has(e.seq)) { expanded.delete(e.seq); toggleDetail(row, e.seq); }
+    return row;
+  }));
+}
+
+// Questions raised by Keep: high risk, clashes, failed checks. Kept until answered.
+const questions = new Map();
+function renderQuestions() {
+  $("questions-wrap").hidden = questions.size === 0;
+  $("questions").replaceChildren(...[...questions.entries()].map(([name, q], i) => {
+    const id = "q-" + i;
+    return el("div", { class: "card question", tabindex: "-1", "data-name": name, "aria-labelledby": id },
+      el("p", { id }, q.text), q.body || null, el("div", { class: "btns" + (q.body ? " end" : "") }, ...q.buttons));
+  }));
+}
+
+// After a question is answered or set aside, focus goes somewhere sensible, not nowhere.
+function afterQuestion() {
+  const next = document.querySelector("#questions .question");
+  const tries = $("tries-wrap").hidden ? null : $("tries-heading");
+  (next || tries || $("timeline-heading")).focus({ preventScroll: false });
+}
+
+// A clash: each file's clashing parts side by side, and a choice per file.
+function clashQuestion(name, r, opts) {
+  const take = {};
+  const waitId = "wait-" + (clashQuestion.n = (clashQuestion.n || 0) + 1);
+  const keepBtn = el("button", { class: "primary", disabled: "", "aria-describedby": waitId,
+    onclick: () => keep(name, { ...opts, take: { ...(opts.take || {}), ...take } }) }, "Keep with these choices");
+  const waiting = el("p", { class: "waiting", id: waitId });
+  const ready = () => {
+    const left = r.questions.filter((q) => !take[q.file]).length;
+    keepBtn.disabled = left > 0;
+    waiting.textContent = left ? `Choose a version for ${plural(left, "more file")}.` : "Ready: these choices are kept.";
+  };
+  const box = (title, text, file) => el("div", { class: "side" + (text ? "" : " none") }, el("h4", {}, title),
+    el("pre", { tabindex: "0", role: "region", "aria-label": `${title}, ${file}` }, text || "(nothing here)"));
+  const body = el("div", {}, ...r.questions.map((q) => {
+    const sides = q.parts.map((p) => el("div", {},
+      el("div", { class: "facts" }, "Around line " + p.line),
+      el("div", { class: "sides" }, box("Main project now", p.main, q.file), box("The Try", p.try, q.file))));
+    const mainBtn = el("button", { "aria-pressed": "false" }, "Keep main's");
+    const tryBtn = el("button", { "aria-pressed": "false" }, "Use the Try's");
+    const pick = (side) => {
+      take[q.file] = side;
+      mainBtn.setAttribute("aria-pressed", String(side === "main"));
+      tryBtn.setAttribute("aria-pressed", String(side === "try"));
+      ready();
+    };
+    mainBtn.onclick = () => pick("main"); tryBtn.onclick = () => pick("try");
+    return el("div", { class: "clash-file" }, el("h3", { class: "file" }, q.file), el("div", { class: "said" }, sentence(q.what)),
+      ...sides, el("div", { class: "choice", role: "group", "aria-label": "Which version of " + q.file }, mainBtn, tryBtn));
+  }));
+  const n = r.questions.length;
+  body.append(waiting);
+  ready();
+  return {
+    text: `“${name}” and the main project both changed ${n === 1 ? "a file" : n + " files"} in ways that can't be combined. Choose which version to keep:`,
+    body,
+    buttons: [keepBtn, el("button", { onclick: () => { questions.delete(name); renderQuestions(); afterQuestion(); } }, "Not now")],
+  };
+}
+
+const sentence = (s) => s ? s[0].toUpperCase() + s.slice(1) + "." : "";
+
+// Compare: ranks the open Tries and suggests one. Only a suggestion: the person keeps.
+let comparison = null;
+async function compare(allow_command) {
+  const btn = $("compare");
+  btn.disabled = true; btn.textContent = "Comparing…";
+  $("compare-result").hidden = false;
+  $("compare-result").replaceChildren(el("div", { class: "empty" }, "Comparing… running each Try's check."));
+  say("Comparing the Tries…");
+  try {
+    comparison = PERSON ? await api("/ui/compare", allow_command ? { allow_command } : {}) : await call("asqu_try_compare");
+    renderComparison();
+    const s = comparison.suggested;
+    say(`Compared ${plural(comparison.tries.length, "Try", "Tries")}. ` + (s ? `Suggested: ${s.name}.` : `No suggestion: ${comparison.no_suggestion}.`));
+  } catch (e) { $("compare-result").hidden = true; comparison = null; renderComparison(); toast(e.message); }
+  btn.disabled = false; btn.textContent = "Compare again";
+  btn.focus();
+}
+
+function renderComparison() {
+  const c = comparison, box = $("compare-result");
+  $("tries").hidden = !!c; // the ranking lists the same Tries, with the same buttons
+  if (!c) { box.hidden = true; return; }
+  box.hidden = false;
+  const pick = c.suggested && c.suggested.name;
+  const rows = c.tries.map((t, i) => {
+    const facts = [];
+    if (t.check) facts.push(t.check.passed ? "check passed" : el("span", { class: "bad" }, "check failed"));
+    facts.push(t.clashes.length ? el("span", { class: "bad" }, t.clashes.length === 1 ? "1 file clashes" : `${t.clashes.length} files clash`) : "combines cleanly");
+    facts.push(t.risk + " risk");
+    const files = t.changes.added.length + t.changes.modified.length + t.changes.deleted.length;
+    facts.push(!files ? "no changes yet" : t.lines_added != null ? plural(t.lines_added + t.lines_removed, "line") + " changed" : plural(files, "file") + " changed");
+    const factLine = el("div", { class: "facts" });
+    facts.forEach((f, j) => { if (j) factLine.append(" · "); factLine.append(f); });
+    const out = t.check && !t.check.passed ? el("pre", { class: "out" }, t.check.output.split("\n").slice(-3).join("\n")) : null;
+    return el("div", { class: "rank" },
+      el("span", { class: "pos" }, (i + 1) + "."),
+      el("div", { class: "what" }, el("b", {}, t.name), t.name === pick ? el("span", { class: "badge" }, "Suggested") : null,
+        t.why ? el("div", { class: "why" }, "“" + t.why + "”") : null, factLine, out),
+      el("button", { class: t.name === pick ? "primary" : "", "aria-label": "Keep " + t.name, onclick: () => keep(t.name) }, "Keep"),
+      el("button", { class: "danger", "aria-label": "Toss " + t.name, onclick: () => toss(t.name) }, "Toss"));
+  });
+  if (!pick) rows.push(el("div", { class: "note" }, sentence("no suggestion: " + c.no_suggestion)));
+  if (c.decider && c.decider.name !== pick) rows.push(el("div", { class: "note decider" }, `Your decider suggests “${c.decider.name}” instead: ${c.decider.why}`));
+  else if (c.decider) rows.push(el("div", { class: "note decider" }, `Your decider agrees: ${c.decider.why}`));
+  const blocked = c.check_command && !c.check_allowed;
+  if (blocked && PERSON) rows.push(el("div", { class: "note" }, "The checks didn't run: this project's check command hasn't been allowed yet. ",
+    el("button", { onclick: async () => {
+      const cmd = c.check_command;
+      const ok = await confirmBox("Allow this project's check?", [
+        el("p", {}, "This command runs in each Try's folder, now and before every Keep:"),
+        el("pre", { class: "out cmd" }, cmd),
+        el("p", {}, "Only allow it if you trust this project. Tries can change what it runs (for example their package scripts).")],
+        "Allow and compare");
+      if (ok) compare(cmd); // only this exact command counts
+    } }, "Allow the check")));
+  else if (blocked) rows.push(el("div", { class: "note" }, "The checks didn't run: allow this project's check in the Asqu view first."));
+  box.replaceChildren(...rows);
+}
+
+$("compare").onclick = () => compare();
+
+async function keep(name, opts = {}) {
+  let showQuestion = false;
+  const hadQuestion = questions.has(name);
+  try {
+    const r = await api("/ui/keep", { name, ...opts });
+    questions.delete(name);
+    if (r.kept) {
+      toast(r.saved_as ? `Kept “${name}” as #${r.saved_as} (${r.risk} risk).` : `Closed “${name}”: nothing from it was added.`);
+    } else if (r.reason === "needs_approval") {
+      questions.set(name, { text: `Keeping “${name}” is high risk: ${r.risk.join("; ")}. Keep it anyway?`, buttons: [
+        el("button", { class: "primary", onclick: () => keep(name, { ...opts, approve: true, fingerprint: r.fingerprint }) }, "Yes, keep it"),
+        el("button", { onclick: () => { questions.delete(name); renderQuestions(); afterQuestion(); } }, "Not now")] });
+    } else if (r.reason === "clash") {
+      questions.set(name, clashQuestion(name, r, opts));
+      showQuestion = true;
+    } else if (r.reason === "check_needs_trust") {
+      questions.set(name, { text: `This project wants to run “${r.command}” as its check before keeping “${name}”. Only allow it if you trust this project.`, buttons: [
+        el("button", { class: "primary", onclick: () => keep(name, { ...opts, trust_check: true, fingerprint: r.fingerprint }) }, "Allow and run it"),
+        el("button", { onclick: () => keep(name, { ...opts, skip_check: true }) }, "Keep without checking"),
+        el("button", { onclick: () => { questions.delete(name); renderQuestions(); afterQuestion(); } }, "Not now")] });
+    } else if (r.reason === "check_failed") {
+      questions.set(name, { text: `The check (${r.check}) failed for “${name}”, so nothing was kept. Fix it in the Try, then keep again.`, buttons: [
+        el("button", { onclick: () => keep(name, opts) }, "Check again"),
+        el("button", { onclick: () => keep(name, { ...opts, skip_check: true }) }, "Keep without checking")] });
+    }
+    renderQuestions(); await refresh(); // the page as it now is, so focus lands on something shown
+    const card = [...document.querySelectorAll("#questions .question")].find((c) => c.dataset.name === name);
+    if (card && (showQuestion || !r.kept)) {
+      card.scrollIntoView({ behavior: reduceMotion() ? "auto" : "smooth", block: "start" });
+      card.focus({ preventScroll: true });
+      say("A question about “" + name + "” needs your answer.");
+    } else if (hadQuestion || r.kept) {
+      afterQuestion();
+    }
+  } catch (e) { toast(e.message); }
+}
+
+async function toss(name) {
+  if (!(await confirmBox(`Toss “${name}”?`, el("p", {}, "The Try's folder is removed. The main project isn't touched."), "Toss"))) return;
+  try { await call("asqu_try_toss", { name }); toast(`Tossed “${name}”.`); refresh(); } catch (e) { toast(e.message); }
+}
+
+function renderTries(tries) {
+  const open = tries.filter((t) => t.status === "open");
+  $("tries-wrap").hidden = open.length === 0;
+  $("compare").hidden = open.length < 2;
+  // A comparison is out of date once its Tries change: some kept or tossed, or new ones started.
+  if (comparison && (comparison.tries.some((t) => !open.find((o) => o.name === t.name))
+      || open.some((o) => !comparison.tries.find((t) => t.name === o.name)))) {
+    comparison = null; renderComparison(); $("compare").textContent = "Compare";
+  }
+  $("tries").replaceChildren(...open.map((t) => el("div", { class: "try" },
+    el("div", { class: "what" }, el("b", {}, t.name), t.why ? el("span", { class: "why" }, "“" + t.why + "” · ") : null,
+      el("span", { class: "count" }, plural(t.files_changed, "file") + " changed"), el("div", { class: "path" }, t.folder)),
+    el("button", { class: "primary", "aria-label": "Keep " + t.name, onclick: () => keep(t.name) }, "Keep"),
+    el("button", { class: "danger", "aria-label": "Toss " + t.name, onclick: () => toss(t.name) }, "Toss"))));
+}
+
+function renderBackups(b) {
+  const rows = b.linked.map((x) => el("div", { class: "backup" + (x.status.includes("failed") ? " bad" : "") },
+    el("div", { class: "what" }, x.status),
+    el("button", { onclick: () => stopBackup(x.place, x.all) }, "Stop")));
+  if (!rows.length) rows.push(el("div", { class: "none" }, "Not backed up anywhere yet. Your history is only on this computer."));
+  rows.push(el("div", {}, el("button", { class: b.linked.length ? "" : "primary", onclick: () => chooseBackup(b.found) },
+    b.linked.length ? "Add another backup place" : "Choose backup place")));
+  $("backups").replaceChildren(...rows);
+}
+
+async function chooseBackup(found) {
+  const where = el("input", { class: "field", placeholder: "A folder, or s3://bucket/path for cloud storage", autocomplete: "off" });
+  const endpoint = el("input", { class: "field", placeholder: "Storage address, e.g. https://<account-id>.r2.cloudflarestorage.com", autocomplete: "off" });
+  const cloud = el("div", { hidden: "" }, el("p", { class: "count" },
+    "Cloud storage needs its access keys set when you start Asqu (ASQU_S3_ACCESS_KEY_ID and ASQU_S3_SECRET_ACCESS_KEY)."), endpoint);
+  where.addEventListener("input", () => { cloud.hidden = !where.value.trim().startsWith("s3://"); });
+  const list = el("div", { class: "places" });
+  const pick = (btn, path) => {
+    for (const b of list.querySelectorAll("button")) b.classList.remove("on");
+    btn.classList.add("on"); where.value = path; cloud.hidden = true;
+  };
+  for (const f of found) {
+    const btn = el("button", {}, f.name, el("small", {}, f.path));
+    btn.onclick = () => pick(btn, f.path);
+    list.append(btn);
+  }
+  const other = el("button", {}, "Other folder…", el("small", {}, "Pick any folder on this computer"));
+  other.onclick = async () => {
+    try {
+      const r = await api("/ui/backup/pick", {});
+      if (r.path) pick(other, r.path);
+    } catch (e) { toast(e.message); }
+  };
+  list.append(other);
+  const everyBox = el("input", { type: "checkbox", id: "every" });
+  everyBox.checked = true;
+  const every = el("label", { class: "count", style: "display:flex;gap:8px;align-items:center;margin-top:10px" },
+    everyBox, "Use this for all my projects (each gets its own folder there)");
+  const ok = await confirmBox("Where should your history be backed up?", [
+    el("p", {}, "Every change is copied there automatically. A cloud-synced folder (like iCloud Drive) keeps a copy off this computer."),
+    list, where, cloud, every], "Back up here");
+  if (!ok || !where.value.trim()) return;
+  toast("Backing up…");
+  try {
+    const r = await api("/ui/backup/link", { place: where.value.trim(), endpoint: endpoint.value.trim(), all: everyBox.checked });
+    toast(everyBox.checked
+      ? `Backed up to ${r.place}. All your projects now back up there automatically.`
+      : `Backed up to ${r.place}. From now on it happens automatically.`);
+  } catch (e) { toast(e.message); }
+  refresh();
+}
+
+async function stopBackup(place, all) {
+  if (!(await confirmBox("Stop backing up this project here?", [el("p", {}, place),
+    el("p", {}, all
+      ? "Only this project is taken out. Your other projects keep backing up there, and the backup already there is kept."
+      : "The backup already there is kept. New changes won't be copied to it.")], "Stop backing up"))) return;
+  try { await api("/ui/backup/unlink", { place }); toast("Stopped backing up there."); refresh(); }
+  catch (e) { toast(e.message); }
+}
+
+function renderSwitch(projects, health) {
+  const sel = $("switch");
+  sel.hidden = false;
+  $("project").hidden = true;
+  const want = PROJECT === "*" ? "*" : health.id;
+  const key = JSON.stringify(projects.map((p) => [p.id, p.name])) + want;
+  if (renderSwitch.key === key) return; // unchanged: don't close the menu while it's open
+  renderSwitch.key = key;
+  const opts = [el("option", { value: "*" }, "All projects")].concat(projects.map((p) =>
+    el("option", { value: p.id }, p.name + (p.current ? " (this folder)" : ""))));
+  sel.replaceChildren(...opts);
+  sel.value = want;
+  sel.onchange = () => setProject(sel.value === health.home ? "" : sel.value);
+}
+
+function renderAll(projects, home) {
+  $("all-list").replaceChildren(...projects.map((p) => {
+    const last = p.last ? `#${p.last.seq} ${p.last.what}` : "No history yet";
+    return el("div", { class: "proj", onclick: () => setProject(p.id === home ? "" : p.id) },
+      el("div", { class: "what" }, el("b", {}, p.name), p.current ? el("span", { class: "here" }, "this folder") : null,
+        el("div", { class: "count" }, last), p.backup ? el("div", { class: "count" }, p.backup) : null),
+      el("span", { class: "meta" }, p.last && p.last.when ? ago(p.last.when) : ""));
+  }));
+}
+
+async function refresh() {
+  if (dialogOpen) return;
+  try {
+    const projects = PERSON ? await api("/ui/projects").catch(() => null) : null;
+    if (PROJECT === "*") {
+      const health = await api("/health");
+      if (projects) { renderSwitch(projects, health); renderAll(projects, health.home); }
+      $("all").hidden = false; $("one").hidden = true; $("welcome").hidden = true;
+      $("undo").hidden = true; $("mark").hidden = true;
+      $("digest").textContent = projects ? `${projects.length} project(s). Click one to see its history.` : "";
+      document.title = "Asqu · all projects";
+      return;
+    }
+    $("all").hidden = true; $("one").hidden = false; $("undo").hidden = false; $("mark").hidden = false;
+    const [health, summary, log, tries, backups] = await Promise.all([
+      api("/health"), call("asqu_summary"), call("asqu_log", { limit: 50 }), call("asqu_try_list"), api(PERSON ? "/ui/backups" : "/backups")]);
+    $("project").textContent = health.name;
+    document.title = "Asqu · " + health.name; // which project this tab is
+    $("digest").textContent = (health.id !== health.home
+      ? "Viewing only: changes here are saved when Asqu runs in that folder. " : "") + "Today: " + summary.summary;
+    if (projects) renderSwitch(projects, health);
+    $("undo").disabled = log.length < 2;
+    renderTimeline(log); renderTries(tries); renderBackups(backups);
+    $("welcome").hidden = log.length > 2;
+  } catch (e) { $("digest").textContent = "Can't reach Asqu: " + e.message; }
+}
+
+$("undo").onclick = async () => {
+  try {
+    const preview = await call("asqu_undo", { dry_run: true });
+    const ok = await confirmBox("Undo the last change?", [el("p", {}, "This will:"), fileList(preview.would),
+      el("p", {}, "Nothing is lost: you can undo this too.")], "Undo");
+    if (!ok) return;
+    const r = await call("asqu_undo");
+    toast(`Undone. Back to #${r.went_back_to}.`); refresh();
+  } catch (e) { toast(e.message); }
+};
+
+$("mark").onclick = async () => {
+  const input = el("input", { placeholder: "e.g. v1 launched", style: "width:100%;font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px;background:transparent;color:inherit" });
+  const ok = await confirmBox("Name this point", [el("p", {}, "You can return here any time by name."), input], "Mark");
+  if (!ok || !input.value.trim()) return;
+  try { const r = await call("asqu_mark", { name: input.value.trim() }); toast(`Marked #${r.seq} as “${r.milestone}”.`); refresh(); }
+  catch (e) { toast(e.message); }
+};
+
+$("ask").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const text = $("ask-input").value.trim();
+  if (!text) return;
+  try { await call("asqu_set_intent", { request: text, once: true }); $("ask-input").value = ""; toast("Got it. Your next change will be saved with that reason."); }
+  catch (e) { toast(e.message); }
+};
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

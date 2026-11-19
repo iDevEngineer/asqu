@@ -1,0 +1,67 @@
+# Runs every test on Windows, Mac and Linux for each push to main.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Keeps compiled dependencies between test runs. Only runs on main save it; release
+      # builds never use it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --locked
+
+  # The Windows installer, run the way people run it, in Windows PowerShell 5.1 (the one
+  # built into Windows), against a local copy of this build.
+  windows-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Keeps compiled dependencies between test runs; only runs on main save it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-install
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --locked
+      - name: Install with install.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $d = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\dl").FullName
+          $asset = 'asqu-x86_64-pc-windows-msvc.zip'
+          Compress-Archive -Path target\release\asqu.exe -DestinationPath "$d\$asset" -Force
+          $h = (Get-FileHash "$d\$asset" -Algorithm SHA256).Hash.ToLower()
+          Set-Content "$d\$asset.sha256" "$h  $asset"
+          $server = Start-Process python -ArgumentList '-m', 'http.server', '8765', '--directory', $d -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          $env:ASQU_DOWNLOAD_BASE = 'http://127.0.0.1:8765'
+          $env:ASQU_INSTALL_DIR = "$env:RUNNER_TEMP\bin"
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          Stop-Process $server
+          $v = & "$env:RUNNER_TEMP\bin\asqu.exe" --version
+          Write-Host "Installed: $v"
+          if (-not ($v -like 'asqu *')) { exit 1 }
+          # Runs on a brand-new Windows: no Visual C++ runtime needed.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents "$env:RUNNER_TEMP\bin\asqu.exe"
+          $deps | Write-Host
+          if ($deps -match 'VCRUNTIME') { Write-Host 'asqu.exe still needs the Visual C++ runtime'; exit 1 }

@@ -1,0 +1,4 @@
+# Windows: build Microsoft's C runtime into asqu.exe, so it runs on a brand-new Windows
+# without the "Visual C++ Redistributable" installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

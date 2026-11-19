@@ -1,0 +1,5 @@
+# Asqu's own settings for building Asqu.
+check = "cargo test --quiet"
+
+[release]
+run = "sh scripts/release.sh"

@@ -1,0 +1,17 @@
+/target
+.asqu/
+.claude/settings.local.json
+.claude/.cc-writes/
+
+# Private working notes: kept on this computer, never published
+.DS_Store
+.claude/
+.gate/
+signoffs.json
+PROGRESS.md
+TASKS.md
+SPEC.md
+spec.html
+ROADMAP.md
+RULES.md
+NOTES.md
