@@ -1,6 +1,6 @@
 [package]
 name = "asqu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Version control that nobody has to manage."
 license = "FSL-1.1-ALv2"
