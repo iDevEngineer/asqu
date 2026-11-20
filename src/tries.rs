@@ -378,40 +378,15 @@ impl Store {
             commit,
             |rel, size| !cfg.too_big(rel, size) || head.contains_key(rel),
             |mut f| {
-                // Git may store one kind of line ending and write the other into the folder.
-                // A file that only differs that way hasn't changed: start from the folder's.
-                let here = top.join(&f.path);
-                // A file the worktree has exactly as git has it is untouched: git's copy is
-                // the starting point, whatever the main project has done to it since.
-                let mut matched = false;
-                if fs::symlink_metadata(&here).is_ok_and(|m| m.is_file()) {
-                    if let Ok(cur) = fs::read(&here) {
-                        if cur == f.data {
-                            matched = true;
-                        } else if crate::worktree::same_but_line_endings(&cur, &f.data) {
-                            f.data = cur;
-                            matched = true;
-                        }
-                    }
-                }
-                // Already edited in the worktree. The main project's copy shows which kind
-                // git writes into folders here; only when it has no copy does the worktree's
-                // own file say.
-                if !matched {
-                    match head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()) {
-                        Some(main) if main == f.data => {}
-                        Some(main) if crate::worktree::same_but_line_endings(&main, &f.data) => f.data = main,
-                        Some(main) => {
-                            if let Some(converted) = crate::worktree::with_line_endings_of(&f.data, &main) {
-                                f.data = converted;
-                            }
-                        }
-                        None => {
-                            let edited = fs::symlink_metadata(&here).ok().filter(|m| m.is_file()).and_then(|_| fs::read(&here).ok());
-                            if let Some(converted) = edited.and_then(|cur| crate::worktree::with_line_endings_of(&f.data, &cur)) {
-                                f.data = converted;
-                            }
-                        }
+                // Git may store one kind of line ending and write the other into folders
+                // (its usual setting on Windows). The starting point is kept the way the
+                // main project has the file, and the Try's files are read the same way
+                // (see `snapshot_try`), so only real changes ever show on either side.
+                if let Some(main) = head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()) {
+                    if crate::worktree::same_but_line_endings(&main, &f.data) {
+                        f.data = main;
+                    } else if let Some(converted) = crate::worktree::in_line_endings_of(&f.data, &main) {
+                        f.data = converted;
                     }
                 }
                 batch_bytes += f.data.len();
@@ -498,12 +473,37 @@ impl Store {
         Ok(())
     }
 
+    /// What is in a Try's folder now. For a worktree, each file is read in the line-ending
+    /// style its starting point has: git may write a file into the worktree with Windows
+    /// line endings although the main project has it without (or the other way round),
+    /// and that alone is never a change.
+    fn snapshot_try(&self, conn: &rusqlite::Connection, row: &Row, dir: &Path, store: bool) -> Result<Manifest> {
+        let mut now = self.snapshot_dir(conn, dir, store)?;
+        if row.path.is_none() {
+            return Ok(now);
+        }
+        let base = self.base_of(row)?;
+        for (path, file) in now.iter_mut() {
+            let Some(start) = base.get(path).filter(|start| start.hash != file.hash) else { continue };
+            let (Ok(was), Ok(cur)) = (self.get_blob(&start.hash), fs::read(dir.join(path))) else { continue };
+            let Some(same_style) = crate::worktree::in_line_endings_of(&cur, &was) else { continue };
+            file.hash = if same_style == was {
+                start.hash
+            } else if store {
+                self.put_blob_near(conn, &same_style, Some(&start.hash))?
+            } else {
+                crate::hash::of(&same_style)
+            };
+        }
+        Ok(now)
+    }
+
     /// The files in a Try's folder that differ from where it started, saved or not.
     pub fn try_changes(&self, name: &str) -> Result<Changes> {
         let row = self.try_row(name)?;
         let dir = self.try_dir(name);
         let now = if self.folder_ok(&row) && dir.is_dir() {
-            self.snapshot_dir(&self.conn, &dir, false)?
+            self.snapshot_try(&self.conn, &row, &dir, false)?
         } else {
             self.manifest_from_hash(&row.manifest)?
         };
@@ -621,7 +621,7 @@ impl Store {
                     bail!("Try \"{name}\" was already {}", found.status);
                 }
                 let dir = self.try_dir(name);
-                let now = self.snapshot_dir(&self.conn, &dir, false)?;
+                let now = self.snapshot_try(&self.conn, &found, &dir, false)?;
                 if Store::diff(&self.manifest_from_hash(&found.manifest)?, &now).is_empty() {
                     return Ok(Changes::default()); // nothing new there since it was closed
                 }
@@ -640,7 +640,7 @@ impl Store {
         let ts = chrono::Utc::now().timestamp();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let old = self.manifest_from_hash(&row.manifest)?;
-        let new = self.snapshot_dir(&tx, &dir, true)?;
+        let new = self.snapshot_try(&tx, &row, &dir, true)?;
         let changes = Store::diff(&old, &new);
         if changes.is_empty() {
             tx.commit()?;
@@ -695,7 +695,7 @@ impl Store {
                 let there = self.folder_ok(&row);
                 let live = row.status == "open" || (row.path.is_some() && !self.try_is_set_aside(&name)?);
                 let now = if live && there && dir.is_dir() {
-                    self.snapshot_dir(&self.conn, &dir, false)?
+                    self.snapshot_try(&self.conn, &row, &dir, false)?
                 } else {
                     self.manifest_from_hash(&row.manifest)?
                 };

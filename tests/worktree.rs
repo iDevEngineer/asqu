@@ -838,7 +838,9 @@ fn a_worktree_changing_a_files_line_endings_is_no_clash_with_an_untouched_file()
     run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
     let kept = run(&main, &home, ASQU, &["try", "keep", "rewritten", "--no-check"]);
     assert!(kept.contains("Kept Try"), "{kept}");
-    assert_eq!(fs::read_to_string(main.join("lines.txt")).unwrap(), "one\r\ntwo\r\nthree\r\nfour\r\nfive (try)\r\n");
+    // The edit arrives; the file keeps the line endings the main project has it in (a
+    // worktree's line endings are often only git's doing, so they are never carried over).
+    assert_eq!(fs::read_to_string(main.join("lines.txt")).unwrap(), "one\ntwo\nthree\nfour\nfive (try)\n");
 }
 
 #[test]
@@ -920,4 +922,32 @@ fn starting_in_a_subfolder_puts_the_history_at_the_top_of_the_project() {
     run(&p, &home, "git", &["init", "-q"]);
     run(&p.join("src/ui"), &home, env!("CARGO_BIN_EXE_asqu"), &["save"]);
     assert!(p.join(".asqu/store.db").exists() && !p.join("src/ui/.asqu").exists());
+}
+
+/// Git's usual setting on Windows: files are stored one way and written into every folder
+/// the other way. The main project's own files here were never rewritten by git, so the
+/// two folders differ in line endings alone, in every file.
+#[test]
+fn a_worktree_whose_files_git_wrote_with_other_line_endings_shows_only_real_changes() {
+    let (_t, home, main) = project();
+    run(&main, &home, "git", &["config", "core.autocrlf", "true"]);
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "crlf");
+    assert!(fs::read(wt.join("other.txt")).unwrap().contains(&b'\r'), "git wrote Windows line endings");
+    assert!(!fs::read(main.join("other.txt")).unwrap().contains(&b'\r'));
+    // Nothing edited yet: nothing shows as changed, on either side.
+    assert!(run(&wt, &home, ASQU, &["status"]).contains("No changes") || !run(&wt, &home, ASQU, &["status"]).contains("other.txt"));
+    let (_, plan) = call(&main, &home, "asqu_try_update", r#"{"name":"crlf","dry_run":true}"#);
+    assert_eq!(plan["status"], "up_to_date", "{plan}");
+    // One real edit on each side, in different files.
+    fs::write(wt.join("app.txt"), "one\r\ntwo\r\nthree (try)\r\n").unwrap();
+    fs::write(main.join("other.txt"), "other (main)\n").unwrap();
+    run(&main, &home, ASQU, &["save", "-w", "Main edit"]);
+    let saved = run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
+    assert!(saved.contains("app.txt") && !saved.contains("other.txt") && !saved.contains(".gitignore"), "{saved}");
+    let kept = run(&main, &home, ASQU, &["try", "keep", "crlf", "--no-check"]);
+    assert!(kept.contains("Kept Try"), "{kept}");
+    // The main project gets the edit, in its own line endings, and keeps its own edit.
+    assert_eq!(fs::read_to_string(main.join("app.txt")).unwrap(), "one\ntwo\nthree (try)\n");
+    assert_eq!(fs::read_to_string(main.join("other.txt")).unwrap(), "other (main)\n");
 }

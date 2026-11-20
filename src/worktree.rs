@@ -526,6 +526,22 @@ pub fn with_line_endings_of(data: &[u8], like: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// `data` written with the kind of line ending `like` has, when each of the two uses one
+/// kind throughout and they differ. `None` when there is nothing to convert (the same
+/// kind already, mixed line endings, or not text).
+pub fn in_line_endings_of(data: &[u8], like: &[u8]) -> Option<Vec<u8>> {
+    if let Some(windows) = with_line_endings_of(data, like) {
+        return Some(windows);
+    }
+    let windows_throughout =
+        data.contains(&b'\n') && data.iter().enumerate().all(|(i, c)| *c != b'\n' || (i > 0 && data[i - 1] == b'\r'));
+    if !windows_throughout || !like.contains(&b'\n') || like.contains(&b'\r') || data.contains(&0) {
+        return None;
+    }
+    // Drop the `\r` of each `\r\n`.
+    Some(data.iter().enumerate().filter(|(i, c)| !(**c == b'\r' && data.get(i + 1) == Some(&b'\n'))).map(|(_, c)| *c).collect())
+}
+
 /// The same text apart from line endings? Git can store a file with one kind of line
 /// ending and write it into the folder with the other (common on Windows).
 pub fn same_but_line_endings(a: &[u8], b: &[u8]) -> bool {
@@ -622,6 +638,11 @@ mod tests {
     #[test]
     fn line_endings() {
         assert!(same_but_line_endings(b"a\r\nb\r\n", b"a\nb\n"));
+        assert_eq!(in_line_endings_of(b"a\r\nb\r\n", b"x\ny\n").as_deref(), Some(&b"a\nb\n"[..]));
+        assert_eq!(in_line_endings_of(b"a\nb\n", b"x\r\ny\r\n").as_deref(), Some(&b"a\r\nb\r\n"[..]));
+        assert_eq!(in_line_endings_of(b"a\nb\n", b"x\ny\n"), None, "the same kind already");
+        assert_eq!(in_line_endings_of(b"a\r\nb\n", b"x\ny\n"), None, "mixed is left alone");
+        assert_eq!(in_line_endings_of(b"a\r\n\0", b"x\n"), None, "not text");
         assert!(same_but_line_endings(b"a\n", b"a\n"));
         assert!(!same_but_line_endings(b"a\nb\n", b"a\nc\n"));
     }
