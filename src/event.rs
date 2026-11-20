@@ -138,6 +138,14 @@ pub fn handle(kind: Option<Kind>, ai: Option<&str>, input: &str, actor: &str) ->
     if !same_place && Store::find_root(&cwd).is_none() {
         return Ok(());
     }
+    // An AI tool started in the home folder (not in any project): nothing to record, and
+    // nothing to say about it on every edit.
+    if Store::find_root(&cwd).is_none() {
+        let top = cwd.ancestors().find(|d| crate::store::is_working_copy(d)).unwrap_or(&cwd);
+        if Store::not_a_project(top).is_some() {
+            return Ok(());
+        }
+    }
     let why = |store: &Store| -> Result<Why> {
         Ok(Why {
             request: store.session_prompt(&session)?.unwrap_or_default(),

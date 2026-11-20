@@ -149,7 +149,7 @@ impl Store {
     /// `worktree`): its work is recorded there, as a Try.
     pub fn find_root(start: &Path) -> Option<PathBuf> {
         for dir in start.ancestors() {
-            if dir.join(DIR).join("store.db").is_file() {
+            if has_usable_store(dir) {
                 return Some(dir.to_path_buf());
             }
             if is_working_copy(dir) {
@@ -165,7 +165,7 @@ impl Store {
     pub fn files_root(start: &Path) -> Option<PathBuf> {
         start
             .ancestors()
-            .find(|dir| dir.join(DIR).join("store.db").is_file() || is_working_copy(dir))
+            .find(|dir| has_usable_store(dir) || is_working_copy(dir))
             .map(Path::to_path_buf)
     }
 
@@ -177,7 +177,7 @@ impl Store {
     /// set up (no git, no shared starting point), the worktree is a project of its own.
     pub fn open_or_create(start: &Path) -> Result<Store> {
         let own = start.ancestors().find_map(|dir| {
-            if dir.join(DIR).join("store.db").is_file() {
+            if has_usable_store(dir) {
                 Some(Some(dir.to_path_buf()))
             } else if is_working_copy(dir) {
                 Some(None)
@@ -196,7 +196,40 @@ impl Store {
                 }
             }
         }
-        Self::open_at(&top.unwrap_or_else(|| start.to_path_buf()))
+        let root = top.unwrap_or_else(|| start.to_path_buf());
+        if let Some(why) = Self::not_a_project(&root) {
+            bail!("{why}");
+        }
+        Self::open_at(&root)
+    }
+
+    /// Why Asqu won't keep a history in this folder, when it is far too wide to be one
+    /// project: the person's home folder, or a folder that holds it (up to the top of the
+    /// drive). Running any command there would otherwise record everything on the
+    /// computer as one project. `None` for any other folder.
+    pub fn not_a_project(root: &Path) -> Option<String> {
+        if !too_wide(root) {
+            return None;
+        }
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let what = if crate::platform::home_dir().and_then(|h| h.canonicalize().ok()).is_some_and(|h| h == root) {
+            "your home folder"
+        } else {
+            "a folder that holds your whole home folder (or the top of the drive)"
+        };
+        let mut why = format!(
+            "{} is {what}, not a project, so Asqu keeps no history here. Go into a project's folder (`cd` there) and run this again.",
+            root.display()
+        );
+        if root.join(DIR).join("store.db").is_file() {
+            why.push_str(&format!(
+                "\nAn earlier version of Asqu started a history here by mistake. It is no longer used, and nothing in it is \
+                 needed by your projects. To remove it, delete the files whose names start with `store` in {} (leave \
+                 everything else there: Asqu's own keys and settings may be in the same folder).",
+                root.join(DIR).display()
+            ));
+        }
+        Some(why)
     }
 
     /// Opens the main project's store for a confirmed worktree, linking the worktree as a
@@ -1453,6 +1486,23 @@ impl Store {
         }
         Ok(problems)
     }
+}
+
+/// Is this folder far too wide to be one project: the person's home folder, a folder that
+/// holds it, or the top of the drive? A folder that is itself a git project is a project
+/// wherever it is (some people keep their home folder's settings in git).
+fn too_wide(dir: &Path) -> bool {
+    if is_working_copy(dir) {
+        return false;
+    }
+    let Ok(dir) = dir.canonicalize() else { return false };
+    dir.parent().is_none() || crate::platform::home_dir().and_then(|h| h.canonicalize().ok()).is_some_and(|home| home.starts_with(&dir))
+}
+
+/// Does this folder hold a history Asqu uses? One started by mistake in a folder too wide
+/// to be a project is not: the projects below it each get their own.
+fn has_usable_store(dir: &Path) -> bool {
+    dir.join(DIR).join("store.db").is_file() && !too_wide(dir)
 }
 
 /// Windows refuses to read a file while another program has it locked (errors 32 and 33).

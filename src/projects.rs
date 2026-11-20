@@ -33,7 +33,8 @@ pub fn id(root: &Path) -> String {
 }
 
 fn exists(root: &Path) -> bool {
-    root.join(crate::store::DIR).join("store.db").is_file()
+    // (A history once started by mistake in the home folder is not a project.)
+    root.join(crate::store::DIR).join("store.db").is_file() && crate::store::Store::not_a_project(root).is_none()
 }
 
 /// How a project is named in the view: its folder, or for a copy made from another
