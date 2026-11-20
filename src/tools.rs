@@ -56,7 +56,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asqu_back",
-            description: "Put the project back to an earlier point described in plain words, e.g. \"Tuesday\", \"2 hours ago\", \"#3\", \"before the signup change\".",
+            description: "Put the project back to an earlier point described in plain words, e.g. \"Tuesday\", \"2 hours ago\", \"#3\", \"before the signup change\". Refused inside a Try's folder, because it changes the main project: the error says where to run it.",
             parameters: json!({ "type": "object", "properties": {
                 "when": { "type": "string", "description": "The point to go back to, in plain words." },
                 "dry_run": dry_run
@@ -108,7 +108,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asqu_try_toss",
-            description: "Throw a Try away. It can be brought back with asqu_try_reopen for 7 days.",
+            description: "Throw a Try away. It can be brought back with asqu_try_reopen for 7 days. A Git worktree linked as a Try keeps its folder and files, and opens again if work carries on there.",
             parameters: json!({ "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] }),
         },
         ToolDef {
@@ -278,10 +278,19 @@ pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str
                 "next": format!("This folder is Try \"{name}\", so this was saved in the Try, not the main project. When it's good, call asqu_try_keep.") }))
         }
         "asqu_set_intent" if here.is_some() => {
-            store.set_try_intent(&here.unwrap_or_default(), &s("request").unwrap_or_default())?;
+            let request = s("request").unwrap_or_default();
+            if request.trim().is_empty() {
+                bail!("say what the person asked for, e.g. asqu intent \"Make signup faster\"");
+            }
+            store.set_try_intent(&here.unwrap_or_default(), &request)?;
             Ok(json!({ "ok": true }))
         }
         "asqu_undo" | "asqu_back" if here.is_some() => bail!("{}", store.main_only_note(&here.unwrap_or_default())),
+        "asqu_mark" if here.is_some() => bail!(
+            "You're in the folder of Try \"{}\". A milestone marks the main project, so set it from its folder: {}",
+            here.unwrap_or_default(),
+            store.root().display()
+        ),
         "asqu_save" => {
             let why = Why { request: s("why").unwrap_or_default(), ..caller(actor) };
             let r = store.save(&why)?;
@@ -451,7 +460,8 @@ fn names_arg(args: &Value) -> Result<Vec<String>> {
 /// `"take": {"app.js": "try", "README.md": "main"}`
 fn take_arg(args: &Value) -> Result<std::collections::BTreeMap<String, crate::tries::Side>> {
     let mut take = std::collections::BTreeMap::new();
-    if let Some(obj) = args.get("take").and_then(Value::as_object) {
+    if let Some(given) = args.get("take").filter(|v| !v.is_null()) {
+        let obj = given.as_object().context("\"take\" must be an object of file names, e.g. {\"app.js\": \"try\"}")?;
         for (path, side) in obj {
             let side = side.as_str().and_then(crate::tries::Side::parse).with_context(|| {
                 format!("\"take\" for {path} must be \"try\" or \"main\"")

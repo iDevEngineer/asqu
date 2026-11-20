@@ -56,8 +56,8 @@ what the person asked you, so please tell it:
    `asqu intent \"<the person's request>\"`
 2. **When you've finished**, run `asqu save`.
 
-If you can't run commands, write the request to `.asqu/intent` (in the main project's folder)
-before editing instead.
+If you can't run commands, write the request to `.asqu/intent` before editing instead (this
+labels the main project's changes only: in a Git worktree, use `asqu intent`).
 
 - To undo or go back: preview with `asqu undo --dry-run` or `asqu back <their words> --dry-run`,
   show the person, then run it without `--dry-run`.

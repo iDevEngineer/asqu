@@ -275,6 +275,59 @@ impl Store {
             })
             .transpose()?
             .with_context(|| format!("there's no Try called \"{name}\" (see `asqu try list`)"))
+            .map(|row| self.follow_moved_worktree(name, row))
+    }
+
+    /// A worktree that was moved (`git worktree move`): git's own entry says where it is
+    /// now. Confirmed like any worktree before the new folder is used.
+    fn follow_moved_worktree(&self, name: &str, mut row: Row) -> Row {
+        if let (Some(_), Some(id)) = (&row.path, &row.wt_id) {
+            if !self.folder_ok(&row) {
+                if let Some(now) = crate::worktree::find_by_identity(self.root(), id) {
+                    if self.conn.execute("UPDATE tries SET path = ?1 WHERE name = ?2", params![now.to_string_lossy(), name]).is_ok() {
+                        row.path = Some(now);
+                    }
+                }
+            }
+        }
+        row
+    }
+
+    /// Open Tries by name, and whether each one's folder is missing. Reads no files.
+    pub fn open_tries(&self) -> Result<Vec<(String, bool)>> {
+        let mut stmt = self.conn.prepare("SELECT name FROM tries WHERE status = 'open' ORDER BY name")?;
+        let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(names
+            .into_iter()
+            .filter_map(|n| self.try_row(&n).ok().map(|row| (n, !self.folder_ok(&row))))
+            .collect())
+    }
+
+    /// The Try a person means by `asked`: its name, or for a worktree, its folder's name
+    /// or path. Says so when two worktrees' folders share that name.
+    pub fn try_named(&self, asked: &str) -> Result<String> {
+        if valid_name(asked).is_ok() && self.try_row(asked).is_ok() {
+            return Ok(asked.to_string());
+        }
+        let as_path = Path::new(asked).canonicalize().ok();
+        let mut stmt = self.conn.prepare("SELECT name FROM tries WHERE path IS NOT NULL ORDER BY name")?;
+        let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let found: Vec<String> = names
+            .into_iter()
+            .filter(|n| {
+                self.try_row(n).ok().and_then(|r| r.path).is_some_and(|p| {
+                    as_path.as_deref() == Some(p.as_path()) || p.file_name().is_some_and(|f| f == std::ffi::OsStr::new(asked))
+                })
+            })
+            .collect();
+        match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Ok(asked.to_string()), // not a folder either: the usual "no Try called" follows
+            many => bail!(
+                "more than one Try's folder is called \"{asked}\": {}. Use the Try's own name (see `asqu try list`).",
+                many.join(", ")
+            ),
+        }
     }
 
     /// Links a confirmed git worktree as a Try of this project, starting from `commit`
@@ -321,13 +374,19 @@ impl Store {
                         }
                     }
                 }
-                // Already edited in the worktree: the main project's own copy shows which
-                // line endings git writes here.
+                // Already edited in the worktree: its own line endings (or failing that, the
+                // main project's copy) show which kind git writes into folders here.
                 if !matched {
-                    if let Some(main) = head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()) {
-                        if main != f.data && crate::worktree::same_but_line_endings(&main, &f.data) {
-                            f.data = main;
-                        }
+                    let edited = fs::symlink_metadata(&here).ok().filter(|m| m.is_file()).and_then(|_| fs::read(&here).ok());
+                    let main = head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok());
+                    if let Some(converted) = edited.as_deref().and_then(|cur| crate::worktree::with_line_endings_of(&f.data, cur)) {
+                        f.data = converted;
+                    } else if let Some(main) = main.filter(|m| *m != f.data && crate::worktree::same_but_line_endings(m, &f.data)) {
+                        f.data = main;
+                    } else if let Some(converted) =
+                        head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()).and_then(|m| crate::worktree::with_line_endings_of(&f.data, &m))
+                    {
+                        f.data = converted;
                     }
                 }
                 batch_bytes += f.data.len();
@@ -406,7 +465,7 @@ impl Store {
                 bail!(
                     "Try \"{name}\" is a Git worktree that holds only part of the project (a sparse checkout), \
                      so Asqu can't tell files that were removed from files that were never there. \
-                     Check out the whole project in {} and try again.",
+                     Have Git fill in the whole project there (`git sparse-checkout disable` in {}) and try again.",
                     path.display()
                 );
             }

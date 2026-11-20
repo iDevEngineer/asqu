@@ -135,7 +135,8 @@ enum Command {
         #[arg(long, default_value_t = asqu::serve::DEFAULT_PORT)]
         port: u16,
     },
-    /// Tries: separate attempts you (or any AI) can keep or toss
+    /// Tries: separate attempts you (or any AI) can keep or toss. A Git worktree of the
+    /// project (an AI tool's own working folder, say) is a Try by itself
     Try {
         #[command(subcommand)]
         cmd: TryCmd,
@@ -289,7 +290,7 @@ enum TryCmd {
     },
     /// Record what's in a Try's folder now
     Save {
-        /// Defaults to the Try whose folder you're in
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
         name: Option<String>,
         #[arg(short, long, default_value = "")]
         why: String,
@@ -308,7 +309,7 @@ enum TryCmd {
     },
     /// Combine a Try into the main project (after the Check and the risk rule)
     Keep {
-        /// Defaults to the Try whose folder you're in
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
         name: Option<String>,
         /// Approve a high-risk change
         #[arg(long)]
@@ -328,7 +329,7 @@ enum TryCmd {
     },
     /// Bring a Try up to date with the main project (the main project's files aren't changed)
     Update {
-        /// Defaults to the Try whose folder you're in
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
         name: Option<String>,
         /// Show what would change in the Try's folder, without changing any files
         /// (unsaved work is saved first)
@@ -340,7 +341,7 @@ enum TryCmd {
     },
     /// Throw a Try away (it can be brought back for 7 days). A Git worktree's folder is left as it is
     Toss {
-        /// Defaults to the Try whose folder you're in
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
         name: Option<String>,
     },
     /// Bring back a tossed Try
@@ -555,17 +556,7 @@ fn pick_try(store: &Store, name: Option<String>) -> Result<String> {
     match name {
         // A worktree's Try is named after its folder, tidied up: the folder's own name
         // (or path) is accepted too.
-        Some(n) => Ok(store
-            .list_tries()
-            .ok()
-            .filter(|all| !all.iter().any(|t| t.name == n))
-            .and_then(|all| {
-                let asked = std::path::Path::new(&n);
-                all.into_iter()
-                    .find(|t| t.worktree && (t.path == asked || t.path.file_name().is_some_and(|f| f == asked.as_os_str())))
-                    .map(|t| t.name)
-            })
-            .unwrap_or(n)),
+        Some(n) => store.try_named(&n),
         None => store
             .try_for_path(&std::env::current_dir()?)
             .context("Which Try? Give its name (see `asqu try list`), or run this inside its folder."),
@@ -679,7 +670,7 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
                 let what = if t.request.is_empty() { String::new() } else { format!("  \"{}\"", printable(&t.request)) };
                 println!("{:<20} {:<7} from #{:<4} {} file(s) changed{what}", t.name, t.status, t.base_seq, t.changed);
                 if t.worktree {
-                    let gone = if t.folder_gone { " (folder removed: Asqu has its work as last saved)" } else { "" };
+                    let gone = if t.folder_gone { " (that worktree was removed: Asqu has its work as last saved)" } else { "" };
                     println!("{:<20} Git worktree: {}{gone}", "", printable(&t.path.display().to_string()));
                 }
                 if let Some(who) = store.reopened_by(&t.name).filter(|_| t.status == "open") {
@@ -841,7 +832,7 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
             store.toss_try(&name, &actor())?;
             println!("Tossed Try \"{name}\". Changed your mind? `asqu try reopen {name}` (for 7 days).");
             if worktree {
-println!("Its Git worktree folder is left exactly as it is. If work carries on there, the Try opens again.");
+                println!("Its Git worktree folder is left exactly as it is. If work carries on there, the Try opens again.");
             }
         }
         TryCmd::Reopen { name } => {
@@ -1497,7 +1488,7 @@ fn main() -> Result<()> {
             let name = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
             anyhow::bail!(
                 "You're in the folder of Try \"{name}\". This command works on the main project, so run it from its folder: {}\n\
-                 The Try's own work is checked when you keep it: `asqu try keep {name}`.",
+                 The Try's work reaches the main project when you keep it: `asqu try keep {name}`.",
                 store.root().display()
             );
         }
@@ -1707,12 +1698,10 @@ fn main() -> Result<()> {
                 }
                 println!("{} file(s) changed.", c.count());
             }
-            let open: Vec<_> = store.list_tries()?.into_iter().filter(|t| t.status == "open").collect();
+            let open = store.open_tries()?;
             if !open.is_empty() {
-                let names: Vec<String> = open
-                    .iter()
-                    .map(|t| if t.folder_gone { format!("{} (folder removed)", t.name) } else { t.name.clone() })
-                    .collect();
+                let names: Vec<String> =
+                    open.iter().map(|(n, gone)| if *gone { format!("{n} (folder removed)") } else { n.clone() }).collect();
                 println!(
                     "{}: {}. See `asqu try list`.",
                     if open.len() == 1 { "1 open Try".to_string() } else { format!("{} open Tries", open.len()) },

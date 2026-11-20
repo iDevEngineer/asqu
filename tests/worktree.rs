@@ -213,7 +213,7 @@ fn a_removed_worktree_folder_is_never_read_as_everything_deleted() {
     assert!(!wt.exists());
 
     let list = run(&main, &home, ASQU, &["try", "list"]);
-    assert!(list.contains("folder removed") && list.contains("1 file(s) changed"), "{list}");
+    assert!(list.contains("that worktree was removed") && list.contains("1 file(s) changed"), "{list}");
     let (ok, out) = attempt(&main, &home, &["try", "update", "gone"]);
     assert!(!ok && out.contains("folder is gone"), "{out}");
 
@@ -394,9 +394,16 @@ fn ai_tool_calls_made_in_a_worktree_act_on_its_try_not_the_main_project() {
     assert!(ok && v["saved_in_try"] == "tools" && v["saved_as"].is_null() && v["files_changed"] == 1, "{v}");
     assert!(run(&main, &home, ASQU, &["try", "list"]).contains("Improve line three"));
     // Undo and going back would change the main project: refused, saying where to run them.
-    for (tool, args) in [("asqu_undo", r#"{"dry_run":true}"#), ("asqu_undo", "{}"), ("asqu_back", r##"{"when":"#1"}"##)] {
+    for (tool, args) in [
+        ("asqu_undo", r#"{"dry_run":true}"#),
+        ("asqu_undo", "{}"),
+        ("asqu_back", r##"{"when":"#1"}"##),
+        ("asqu_mark", r#"{"name":"from-worktree"}"#),
+        ("asqu_set_intent", r#"{"request":" "}"#),
+    ] {
         let (ok, v) = call(&wt, &home, tool, args);
-        assert!(!ok && v["error"].as_str().unwrap().contains("Try \"tools\""), "{tool}: {v}");
+        let said = v["error"].as_str().unwrap_or_default();
+        assert!(!ok && (said.contains("Try \"tools\"") || said.contains("say what the person asked")), "{tool}: {v}");
     }
     assert_eq!(entries(&main), before, "the main project's Timeline is untouched");
     assert_eq!(text(&main.join("other.txt")), "main moved on\n");
@@ -524,6 +531,58 @@ fn a_project_that_fetches_files_on_demand_is_never_read_through_git() {
 }
 
 #[test]
+fn reading_a_commit_never_fetches_a_missing_file() {
+    // The real thing: a project set to fetch missing files with a command of its choosing,
+    // allowed by its own settings, with a file actually missing. Reading the commit must
+    // fail without running that command.
+    let (t, home, main) = project();
+    let marker = t.path().join("fetched");
+    let command = format!("sh -c 'echo x > {}'", marker.to_string_lossy().replace('\\', "/"));
+    let url = main.to_string_lossy().replace('\\', "/");
+    for (key, value) in [
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.url", url.as_str()),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.uploadpack", command.as_str()),
+        ("protocol.file.allow", "always"),
+        ("protocol.allow", "always"),
+    ] {
+        run(&main, &home, "git", &["config", key, value]);
+    }
+    let commit = run(&main, &home, "git", &["rev-parse", "HEAD"]).trim().to_string();
+    let blob = run(&main, &home, "git", &["rev-parse", "HEAD:app.txt"]).trim().to_string();
+    let object = main.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    assert!(object.is_file(), "the file's stored copy");
+    fs::remove_file(&object).unwrap();
+
+    let mut read = 0;
+    let result = asqu::worktree::read_commit(&main, &commit, |_, _| true, |_| {
+        read += 1;
+        Ok(())
+    });
+    assert!(result.is_err(), "the missing file can't be read");
+    assert!(!marker.exists(), "and nothing was run to fetch it");
+}
+
+#[test]
+fn moving_the_main_project_keeps_each_worktrees_try() {
+    let (t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = t.path().join("beside");
+    run(&main, &home, "git", &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "beside"]);
+    fs::write(wt.join("other.txt"), "changed\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "Change"]);
+
+    let moved = t.path().join("shop-renamed");
+    fs::rename(&main, &moved).unwrap();
+    run(&moved, &home, "git", &["worktree", "repair", wt.to_str().unwrap()]);
+    fs::write(wt.join("app.txt"), "more\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "More"]);
+    let list = run(&moved, &home, ASQU, &["try", "list"]);
+    assert!(list.contains("2 file(s) changed") && !list.contains("beside-2") && !list.contains("was removed"), "{list}");
+}
+
+#[test]
 fn a_receipt_checked_in_a_worktree_is_checked_against_the_files_there() {
     let (_t, home, main) = project();
     fs::write(main.join("asqu.toml"), "check = \"git --version\"\n").unwrap();
@@ -554,6 +613,8 @@ fn line_endings_git_changes_never_cause_a_clash() {
     // Edited in the worktree before Asqu has run there, and in the main project too.
     fs::write(wt.join("lines.txt"), "one\r\ntwo\r\nthree\r\nfour\r\nfive (try)\r\n").unwrap();
     fs::write(main.join("lines.txt"), "one (main)\r\ntwo\r\nthree\r\nfour\r\nfive\r\n").unwrap();
+    // The main project's edit is saved first, as an AI tool's hook or the watcher would.
+    run(&main, &home, ASQU, &["save", "-w", "Main edit"]);
     run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
     let kept = run(&main, &home, ASQU, &["try", "keep", "endings", "--no-check"]);
     assert!(kept.contains("Kept Try"), "{kept}");
@@ -601,9 +662,12 @@ fn a_moved_worktree_keeps_its_try_and_its_folder_name_finds_it() {
     let moved = t.path().join("moved here");
     run(&main, &home, "git", &["worktree", "move", ".claude/worktrees/odd name (v2)", moved.to_str().unwrap()]);
     fs::write(moved.join("app.txt"), "more\n").unwrap();
+    // Seen from the main project straight away, before any command has run in the new folder.
+    let list = run(&main, &home, ASQU, &["try", "list"]);
+    assert!(list.contains("2 file(s) changed") && !list.contains("was removed"), "{list}");
     run(&moved, &home, ASQU, &["save", "-w", "More"]);
     let list = run(&main, &home, ASQU, &["try", "list"]);
-    assert!(list.contains("2 file(s) changed") && !list.contains("folder removed") && !list.contains("moved-here"), "{list}");
+    assert!(list.contains("2 file(s) changed") && !list.contains("was removed") && !list.contains("moved-here"), "{list}");
     // The folder's own name works where the Try's name is asked for.
     let kept = run(&main, &home, ASQU, &["try", "keep", "moved here", "--no-check"]);
     assert!(kept.contains("Kept Try \"odd-name-v2\""), "{kept}");

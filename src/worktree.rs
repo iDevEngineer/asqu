@@ -52,7 +52,17 @@ pub fn identity(top: &Path) -> Option<String> {
     let file = std::os::unix::fs::MetadataExt::ino(&made);
     #[cfg(not(unix))]
     let file = made.len();
-    Some(format!("{}|{when}|{file}", entry.to_string_lossy()))
+    // The entry's own name, not where the project is: the project folder may be moved.
+    Some(format!("{}|{when}|{file}", entry.file_name()?.to_string_lossy()))
+}
+
+/// Where the worktree with this identity is now, going by git's own entry for it in the
+/// main project (git updates that when the worktree is moved).
+pub fn find_by_identity(main: &Path, id: &str) -> Option<PathBuf> {
+    let name = id.split('|').next().filter(|n| !n.is_empty() && !n.contains(['/', '\\']) && *n != "." && *n != "..")?;
+    let pointer = read_pointer(&main.join(".git").join("worktrees").join(name).join("gitdir"))?;
+    let top = Path::new(&pointer).parent()?.canonicalize().ok()?;
+    (main_of(&top).as_deref() == Some(main) && identity(&top).as_deref() == Some(id)).then_some(top)
 }
 
 /// The main project's folder and git's own entry for the worktree, when `top` is a
@@ -61,6 +71,11 @@ fn confirm(top: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = top.join(".git");
     let pointer = read_pointer(&dot_git)?;
     let gitdir = pointer.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    // Never follow a pointer to another computer: just looking there would contact it.
+    let remote = |p: &str| p.starts_with("\\\\") || p.starts_with("//");
+    if remote(gitdir) || read_pointer(&top.join(gitdir).join("commondir")).is_some_and(|c| remote(&c)) {
+        return None;
+    }
     // Relative paths are relative to the worktree; an absolute one replaces it.
     let admin = top.join(gitdir).canonicalize().ok()?;
     let common = admin.join(read_pointer(&admin.join("commondir"))?).canonicalize().ok()?;
@@ -98,9 +113,14 @@ fn git(dir: &Path) -> Command {
         "-c",
         "protocol.allow=never",
     ]);
-    // Never fetch a missing file on demand (git 2.45 and later; older ones are covered by
-    // `fetches_on_demand` and by allowing no way of fetching at all).
+    // Never fetch a missing file on demand (git 2.45 and later). For older ones, and as a
+    // second layer: `GIT_ALLOW_PROTOCOL` allows no way of fetching at all, whatever the
+    // project's own settings say. (The `-c protocol.allow=never` above is only a default a
+    // project's settings can override: never rely on it alone.) And `fetches_on_demand`
+    // keeps such projects from being read in the first place.
     c.env("GIT_NO_LAZY_FETCH", "1").env("GIT_ALLOW_PROTOCOL", "none");
+    // Read git's real history, not objects a project has told git to swap in.
+    c.env("GIT_NO_REPLACE_OBJECTS", "1");
     for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE", "GIT_PREFIX"] {
         c.env_remove(var);
     }
@@ -121,8 +141,38 @@ fn is_commit_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn one_id(mut cmd: Command) -> Result<String> {
-    let out = cmd.output().context("git couldn't be run")?;
+/// How long git may take to answer. A project's settings can make git wait for ever (by
+/// pointing it at something that never answers): then the answer is "git can't say".
+const GIT_ANSWER_SECS: u64 = 30;
+
+/// Runs a git command to the end, or stops it when it takes too long.
+fn answer(mut cmd: Command) -> Result<std::process::Output> {
+    let mut child = cmd.stdout(Stdio::piped()).spawn().context("git couldn't be run")?;
+    let mut out = child.stdout.take().context("git couldn't be run")?;
+    // Read from another thread, so a long answer never blocks git while we wait for it.
+    let reading = std::thread::spawn(move || {
+        let mut data = Vec::new();
+        let _ = out.read_to_end(&mut data);
+        data
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GIT_ANSWER_SECS);
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("git took too long to answer");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(15)),
+        }
+    };
+    let stdout = reading.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr: Vec::new() })
+}
+
+fn one_id(cmd: Command) -> Result<String> {
+    let out = answer(cmd).context("git couldn't be run")?;
     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || !is_commit_id(&id) {
         bail!("git couldn't answer");
@@ -136,7 +186,7 @@ fn one_id(mut cmd: Command) -> Result<String> {
 fn fetches_on_demand(dir: &Path) -> bool {
     let mut c = git(dir);
     c.args(["config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$"]);
-    match c.output() {
+    match answer(c) {
         // Exit 1 with nothing printed: no such setting.
         Ok(out) => !(out.status.code() == Some(1) && out.stdout.iter().all(|b| b.is_ascii_whitespace())),
         Err(_) => true,
@@ -150,7 +200,7 @@ pub fn partly_checked_out(top: &Path) -> bool {
     let mut c = git(top);
     // Each entry: "<mark> <path>", ended by a zero byte. The mark S: left out on purpose.
     c.args(["ls-files", "-t", "-z"]);
-    match c.output() {
+    match answer(c) {
         Ok(out) if out.status.success() => {
             out.stdout.is_empty() || out.stdout.split(|b| *b == 0).any(|e| e.starts_with(b"S ") || e.starts_with(b"s "))
         }
@@ -217,7 +267,7 @@ pub fn read_commit(
     }
     let mut c = git(top);
     c.args(["ls-tree", "-r", "-z", "-l", "--full-tree", commit]);
-    let out = c.output().context("git couldn't be run")?;
+    let out = answer(c)?;
     if !out.status.success() {
         bail!("git couldn't list the files of the starting point");
     }
@@ -235,7 +285,9 @@ pub fn read_commit(
             ("blob", "100755") => true,
             _ => continue, // a link, or another project nested inside
         };
-        let Ok(size) = size.parse::<u64>() else { continue };
+        // No size: git doesn't have the file's contents (and may not fetch them). A starting
+        // point with files missing would be a wrong one, so there is none.
+        let Ok(size) = size.parse::<u64>() else { bail!("git doesn't hold every file of the starting point") };
         if !is_commit_id(id) || !usable_path(path) || !want(path, size) {
             continue;
         }
@@ -283,6 +335,25 @@ pub fn read_commit(
     let _ = child.wait();
     let _ = asking.join();
     result
+}
+
+/// `data` with every line ending written the Windows way, when `like` (the same file as
+/// it is in the folder) is written that way throughout and `data` not at all. This is
+/// what git does on checkout when it is set to convert line endings.
+pub fn with_line_endings_of(data: &[u8], like: &[u8]) -> Option<Vec<u8>> {
+    let windows_throughout =
+        like.contains(&b'\n') && like.iter().enumerate().all(|(i, c)| *c != b'\n' || (i > 0 && like[i - 1] == b'\r'));
+    if !windows_throughout || data.contains(&b'\r') || data.contains(&0) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() + data.len() / 16);
+    for c in data {
+        if *c == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(*c);
+    }
+    Some(out)
 }
 
 /// The same text apart from line endings? Git can store a file with one kind of line

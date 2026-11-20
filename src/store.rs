@@ -429,6 +429,20 @@ impl Store {
                 tx.commit()?;
             }
         }
+        // Histories opened by an early test build of format 7 lack this column.
+        let has_wt_id: bool = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('tries') WHERE name = 'wt_id'", [], |r| r.get::<_, i64>(0))?
+            > 0;
+        if !has_wt_id {
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            let again: i64 =
+                tx.query_row("SELECT COUNT(*) FROM pragma_table_info('tries') WHERE name = 'wt_id'", [], |r| r.get(0))?;
+            if again == 0 {
+                tx.execute_batch("ALTER TABLE tries ADD COLUMN wt_id TEXT;")?;
+            }
+            tx.commit()?;
+        }
         // Histories made by early test builds of format 6 lack this column.
         let has_checked: bool = self
             .conn
@@ -1390,7 +1404,7 @@ impl Store {
             let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>)> =
                 stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
             for (name, manifest, base) in rows {
-                for (what, stored) in [("files", Some(manifest)), ("starting point", base)] {
+                for (what, stored) in [("saved files", Some(manifest)), ("starting point", base)] {
                     let Some(h) = stored.as_deref().and_then(hash::from_slice) else { continue };
                     let missing = match self.manifest_from_hash(&h) {
                         Err(_) => true,
@@ -1399,7 +1413,7 @@ impl Store {
                         }),
                     };
                     if missing {
-                        problems.push(format!("Try \"{}\": some of its {what} are missing from the history", describe::printable(&name)));
+                        problems.push(format!("Try \"{}\": part of its {what} is missing from the history", describe::printable(&name)));
                     }
                 }
             }
