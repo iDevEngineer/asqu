@@ -190,3 +190,35 @@ fn first_runs_at_the_same_moment_share_one_signing_key() {
     assert_eq!(keys.iter().filter(|e| e.file_name() == "identity.key").count(), 1);
     assert!(!keys.iter().any(|e| e.file_name().to_string_lossy().ends_with(".tmp")), "no leftovers");
 }
+
+/// Windows won't let a file be read while another program has it locked (an AI tool's own
+/// lock file, an open database). That never stops a save, and never reads as "removed".
+#[cfg(windows)]
+#[test]
+fn a_file_another_program_has_locked_never_stops_a_save() {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.txt", b"one");
+    write(dir.path(), ".tool/state.lock", b"saved before");
+    let mut store = Store::open_or_create(dir.path()).unwrap();
+    store.save(&why("start")).unwrap().unwrap();
+
+    // Another program now holds both a file Asqu already has and a brand-new one.
+    let lock = |rel: &str| fs::OpenOptions::new().write(true).create(true).share_mode(0).open(dir.path().join(rel)).unwrap();
+    let mut held = lock(".tool/state.lock");
+    held.write_all(b"changed while locked").unwrap();
+    held.flush().unwrap();
+    let _new = lock(".tool/new.lock");
+    assert!(fs::read(dir.path().join(".tool/state.lock")).is_err(), "really locked");
+
+    write(dir.path(), "a.txt", b"one, edited");
+    let saved = store.save(&why("edit")).unwrap().unwrap();
+    assert_eq!(saved.changes.modified, vec!["a.txt"]);
+    assert!(saved.changes.added.is_empty() && saved.changes.deleted.is_empty(), "{:?}", saved.changes);
+
+    // Once it is let go, its change is recorded like any other.
+    drop(held);
+    let later = store.save(&why("after")).unwrap().unwrap();
+    assert!(later.changes.modified.contains(&".tool/state.lock".to_string()), "{:?}", later.changes);
+}

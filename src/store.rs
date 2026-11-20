@@ -136,6 +136,8 @@ pub struct Store {
     identity: Option<Option<crate::sign::Identity>>,
     /// Files the last scan left out for being too big (see `max_file_mb` in asqu.toml).
     skipped_large: std::cell::RefCell<Vec<String>>,
+    /// Files another program had locked, already mentioned in this run.
+    told_locked: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl Store {
@@ -257,7 +259,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
-        let store = Store { root, conn, identity: None, skipped_large: Default::default() };
+        let store = Store { root, conn, identity: None, skipped_large: Default::default(), told_locked: Default::default() };
         store.migrate()?;
         Ok(store)
     }
@@ -839,6 +841,22 @@ impl Store {
                     let data = match fs::read(&abs) {
                         Ok(d) => d,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        // Another program holds it (its own lock file, an open database).
+                        // That is no reason to stop, and never a sign the file is gone: it
+                        // stays as it was last saved, or unrecorded if it never was.
+                        Err(e) if locked_by_another_program(&e) => {
+                            if self.told_locked.borrow_mut().insert(rel.clone()) {
+                                eprintln!(
+                                    "asqu: couldn't read {}: another program has it locked. {}",
+                                    crate::describe::printable(&rel),
+                                    if head.contains_key(&rel) { "It stays as last saved." } else { "It isn't recorded this time." }
+                                );
+                            }
+                            if let Some(last) = head.get(&rel) {
+                                m.insert(rel, *last);
+                            }
+                            continue;
+                        }
                         Err(e) => return Err(e).with_context(|| format!("reading {rel}")),
                     };
                     if store {
@@ -1435,6 +1453,11 @@ impl Store {
         }
         Ok(problems)
     }
+}
+
+/// Windows refuses to read a file while another program has it locked (errors 32 and 33).
+fn locked_by_another_program(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33))
 }
 
 /// Is this folder the top of a working copy: a git project (`.git` folder) or a git
