@@ -61,7 +61,7 @@ You don't have to switch, and nothing in your project changes. Asqu works in the
 - **Your `.gitignore` already works.** Asqu skips the same files Git does. Add an `.asquignore` (same format) only if you want Asqu to skip more.
 - **Git never sees Asqu.** Asqu's history lives in a `.asqu` folder that it keeps out of `git status` by itself, without touching your `.gitignore`, so nothing changes for teammates.
 - **Keep committing and pushing as before**, or stop when you no longer need to. Asqu's Timeline starts from the day you first use it; your earlier Git history stays in Git.
-- **Git worktrees are understood.** A worktree an AI tool makes inside your project is treated as its own project, not saved twice.
+- **A Git worktree is a Try.** When an AI tool makes its own worktree of your project, Asqu records the work there as a Try of the main project by itself. `asqu try keep` combines it, with no branch, pull request or merge, and `asqu try update` brings in what changed in the main project meanwhile. Asqu never removes the worktree's folder.
 
 ## Build from source
 

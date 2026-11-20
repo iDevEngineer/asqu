@@ -159,14 +159,20 @@ pub fn handle(kind: Option<Kind>, ai: Option<&str>, input: &str, actor: &str) ->
             }
             let store = Store::open_or_create(&cwd)?;
             store.set_session_prompt(&session, &shorten(&prompt))?;
-            // Also label saves by anything else (the watcher, say) during this task.
-            store.set_intent(&shorten(&prompt))?;
+            if let Some(name) = store.try_for_path(&cwd) {
+                // Asked inside a Try's folder (a worktree, say): it labels that Try's saves,
+                // not the main project's.
+                store.set_try_intent(&name, &shorten(&prompt))?;
+            } else {
+                // Also label saves by anything else (the watcher, say) during this task.
+                store.set_intent(&shorten(&prompt))?;
+            }
         }
         Kind::Edit => {
             let mut store = Store::open_or_create(&cwd)?;
             let why = why(&store)?;
             // An edit inside a Try's folder belongs to that Try, not the main project.
-            if let Some(name) = find_path(&v).and_then(|p| store.try_for_path(&p)) {
+            if let Some(name) = find_path(&v).and_then(|p| store.try_for_path(&p)).or_else(|| store.try_for_path(&cwd)) {
                 store.save_try(&name, &why)?;
             } else {
                 store.save(&why)?;
@@ -175,8 +181,12 @@ pub fn handle(kind: Option<Kind>, ai: Option<&str>, input: &str, actor: &str) ->
         Kind::Done => {
             let mut store = Store::open_or_create(&cwd)?;
             let why = why(&store)?;
-            store.save(&why)?;
-            store.clear_intent(); // the task is finished
+            if let Some(name) = store.try_for_path(&cwd) {
+                store.save_try(&name, &why)?; // work done in a Try's folder belongs to that Try
+            } else {
+                store.save(&why)?;
+                store.clear_intent(); // the task is finished
+            }
         }
     }
     Ok(())

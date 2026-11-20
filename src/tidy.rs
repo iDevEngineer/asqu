@@ -14,7 +14,7 @@
 //! Runs by itself at most once a day; `asqu tidy --dry-run` shows what it would do.
 
 use crate::hash::{self, Hash};
-use crate::store::{Store, DIR, ENC_RAW, MAX_DEPTH, ROLLBACK_COPY};
+use crate::store::{Store, DIR, ENC_RAW, MAX_DEPTH, ROLLBACK_COPIES};
 use anyhow::Result;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -99,7 +99,8 @@ impl Store {
         // a while on a long history), then removed under it, re-checking each one is still
         // old, so anything a save has used meanwhile stays.
         let unneeded = self.unneeded_versions(now)?;
-        let keep_large_files = fs::symlink_metadata(self.root().join(DIR).join(ROLLBACK_COPY)).is_ok();
+        let keep_large_files =
+            ROLLBACK_COPIES.iter().any(|name| fs::symlink_metadata(self.root().join(DIR).join(name)).is_ok());
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let mut removed_large = Vec::new();
         for (h, external) in &unneeded {
@@ -126,15 +127,22 @@ impl Store {
 
         report.compressed = self.compress_old_versions()?;
 
-        let copy = self.root().join(DIR).join(ROLLBACK_COPY);
-        let old_enough = fs::symlink_metadata(&copy)
-            .ok()
-            .filter(|m| m.is_file())
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age.as_secs() > ROLLBACK_KEEP_SECS);
-        if old_enough && fs::remove_file(&copy).is_ok() {
-            report.rollback_copy_removed = true;
+        for name in ROLLBACK_COPIES {
+            let copy = self.root().join(DIR).join(name);
+            let old_enough = fs::symlink_metadata(&copy)
+                .ok()
+                .filter(|m| m.is_file())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() > ROLLBACK_KEEP_SECS);
+            if old_enough && fs::remove_file(&copy).is_ok() {
+                report.rollback_copy_removed = true;
+            }
+        }
+        // Big files only a removed copy still used can go, once no copy is left.
+        if report.rollback_copy_removed
+            && !ROLLBACK_COPIES.iter().any(|name| fs::symlink_metadata(self.root().join(DIR).join(name)).is_ok())
+        {
             self.sweep_large_files()?;
         }
 

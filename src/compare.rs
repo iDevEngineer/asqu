@@ -126,7 +126,7 @@ impl Store {
             }
             self.save_try(name, &who)?;
             let row = self.try_row(name)?;
-            let base = self.manifest_at(row.base_seq)?;
+            let base = self.base_of(&row)?;
             let theirs = self.manifest_from_hash(&row.manifest)?;
             let changes = Store::diff(&base, &theirs);
             let lines = self.line_totals(&base, &theirs, &changes)?;

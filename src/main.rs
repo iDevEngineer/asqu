@@ -325,6 +325,17 @@ enum TryCmd {
         #[arg(long)]
         trust_check: bool,
     },
+    /// Bring a Try up to date with the main project (the main project isn't changed)
+    Update {
+        /// Defaults to the Try whose folder you're in
+        name: Option<String>,
+        /// Show what would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// After a clash, which version of a file to keep: try:<file> or main:<file> (repeat for more files)
+        #[arg(long, value_name = "SIDE:FILE")]
+        take: Vec<String>,
+    },
     /// Throw a Try away (it can be brought back for 7 days)
     Toss { name: Option<String> },
     /// Bring back a tossed Try
@@ -544,6 +555,22 @@ fn pick_try(store: &Store, name: Option<String>) -> Result<String> {
     }
 }
 
+/// `--take try:<file>` / `--take main:<file>`, as a choice per file.
+fn takes(take: &[String]) -> Result<std::collections::BTreeMap<String, asqu::tries::Side>> {
+    let mut chosen = std::collections::BTreeMap::new();
+    for t in take {
+        let (side, file) = t
+            .split_once(':')
+            .and_then(|(s, f)| Some((asqu::tries::Side::parse(s)?, f)))
+            .filter(|(_, f)| !f.is_empty())
+            .with_context(|| format!("--take {t}: write try:<file> or main:<file>"))?;
+        if chosen.insert(file.to_string(), side).is_some_and(|before| before != side) {
+            anyhow::bail!("--take names {file} twice, once for each side: choose one");
+        }
+    }
+    Ok(chosen)
+}
+
 fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
     use asqu::tries::{KeepOptions, KeepOutcome};
     match cmd {
@@ -616,20 +643,63 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
             for t in tries {
                 let what = if t.request.is_empty() { String::new() } else { format!("  \"{}\"", printable(&t.request)) };
                 println!("{:<20} {:<7} from #{:<4} {} file(s) changed{what}", t.name, t.status, t.base_seq, t.changed);
+                if t.worktree {
+                    let gone = if t.folder_gone { " (folder gone: stands as last saved)" } else { "" };
+                    println!("{:<20} git worktree: {}{gone}", "", printable(&t.path.display().to_string()));
+                }
+            }
+        }
+        TryCmd::Update { name, dry_run, take } => {
+            use asqu::tries::UpdateOutcome;
+            let name = pick_try(store, name)?;
+            let chosen = takes(&take)?;
+            match store.update_try(&name, &chosen, dry_run, &actor())? {
+                UpdateOutcome::UpToDate => println!("Try \"{name}\" already has everything in the main project."),
+                UpdateOutcome::Updated { changes, dry_run } => {
+                    if dry_run {
+                        println!("Bringing Try \"{name}\" up to date would change these files in its folder:");
+                    } else {
+                        println!("Try \"{name}\" is up to date with the main project. Changed in its folder:");
+                    }
+                    if changes.is_empty() {
+                        println!("  nothing (it already holds the main project's changes).");
+                    }
+                    for p in &changes.added {
+                        println!("  added     {}", printable(p));
+                    }
+                    for p in &changes.modified {
+                        println!("  changed   {}", printable(p));
+                    }
+                    for p in &changes.deleted {
+                        println!("  removed   {}", printable(p));
+                    }
+                    if dry_run {
+                        println!("Nothing was changed. Run it without --dry-run to do it.");
+                    }
+                }
+                UpdateOutcome::Clash { files, questions } => {
+                    println!("The Try and the main project changed the same parts of {} file(s), so nothing was changed:", files.len());
+                    for q in &questions {
+                        println!("  {}: {}", printable(&q.path), q.what);
+                    }
+                    let mut again = format!("asqu try update {name}");
+                    for (path, side) in &chosen {
+                        let side = if *side == asqu::tries::Side::Try { "try" } else { "main" };
+                        again += &format!(" --take {side}:{}", shell_word(path).unwrap_or_else(|| "<file>".into()));
+                    }
+                    let q = shell_word(&files[0]).unwrap_or_else(|| "<file>".into());
+                    println!("\nChoose which to keep for each file, then update again, e.g.:");
+                    println!("  {again} --take try:{q}     (the Try's version)");
+                    println!("  {again} --take main:{q}    (the main project's version)");
+                    std::process::exit(1);
+                }
             }
         }
         TryCmd::Keep { name, yes, no_check, prefer_try, take, trust_check } => {
             let name = pick_try(store, name)?;
-            let mut chosen = std::collections::BTreeMap::new();
-            for t in &take {
-                let (side, file) = t
-                    .split_once(':')
-                    .and_then(|(s, f)| Some((asqu::tries::Side::parse(s)?, f)))
-                    .filter(|(_, f)| !f.is_empty())
-                    .with_context(|| format!("--take {t}: write try:<file> or main:<file>"))?;
-                if chosen.insert(file.to_string(), side).is_some_and(|before| before != side) {
-                    anyhow::bail!("--take names {file} twice, once for each side: choose one");
-                }
+            let chosen = takes(&take)?;
+            if store.list_tries()?.iter().any(|t| t.name == name && t.status == "open" && t.folder_gone) {
+                println!("The worktree folder for Try \"{name}\" is gone, so this keeps it as it was last saved.");
             }
             // Approvals only count for exactly what the person was shown: ask about the
             // result as it is now, then keep that result (if it changed meanwhile, ask again).
@@ -732,8 +802,12 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
         }
         TryCmd::Toss { name } => {
             let name = pick_try(store, name)?;
+            let worktree = store.list_tries()?.iter().any(|t| t.name == name && t.worktree);
             store.toss_try(&name, &actor())?;
             println!("Tossed Try \"{name}\". Changed your mind? `asqu try reopen {name}` (for 7 days).");
+            if worktree {
+                println!("Its git worktree folder is left exactly as it is. If work carries on there, the Try opens again.");
+            }
         }
         TryCmd::Reopen { name } => {
             let dir = if store.try_is_set_aside(&name)? {
@@ -1364,6 +1438,10 @@ fn main() -> Result<()> {
             }
             std::process::exit(r.exit_code);
         }
+        Command::Undo { .. } | Command::Back { .. } if store.try_for_path(&std::env::current_dir()?).is_some() => {
+            let name = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
+            anyhow::bail!("{}", store.main_only_note(&name));
+        }
         Command::Undo { steps, dry_run } => {
             let target = asqu::tools::undo_target(&store, steps)?;
             go_back(&mut store, target, dry_run)?;
@@ -1377,6 +1455,10 @@ fn main() -> Result<()> {
             if clear {
                 store.clear_intent();
                 println!("Cleared the current request.");
+            } else if let Some(name) = store.try_for_path(&std::env::current_dir()?) {
+                let request = request.context("say what the person asked for, e.g. asqu intent \"Make signup faster\"")?;
+                store.set_try_intent(&name, &request)?;
+                println!("Got it. Changes in Try \"{name}\" will be saved as: \"{}\"", request.trim());
             } else {
                 let request = request.context("say what the person asked for, e.g. asqu intent \"Make signup faster\"")?;
                 store.set_intent(&request)?;
@@ -1502,6 +1584,13 @@ fn main() -> Result<()> {
             };
             save()?;
             asqu::watch::run(&root, std::time::Duration::from_secs(settle), save)?;
+        }
+        Command::Status if store.try_for_path(&std::env::current_dir()?).is_some() => {
+            let name = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
+            let changed = store.list_tries()?.into_iter().find(|t| t.name == name).map(|t| t.changed).unwrap_or(0);
+            println!("This folder is Try \"{name}\" of {}.", store.root().display());
+            println!("{changed} file(s) differ from where it started.");
+            println!("Keep its work: `asqu try keep {name}`. Bring in the main project's changes: `asqu try update {name}`.");
         }
         Command::Status => {
             let c = store.status()?;

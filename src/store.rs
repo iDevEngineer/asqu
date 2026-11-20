@@ -18,10 +18,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const DIR: &str = ".asqu";
 /// Files bigger than this live beside the database in `.asqu/large/`.
 pub const LARGE_FILE_BYTES: usize = 1024 * 1024;
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 /// A full copy of the history as it was before the smaller format (schema 6), so an older
 /// Asqu can be put back. Tidy removes it after `ROLLBACK_KEEP_SECS`.
 pub const ROLLBACK_COPY: &str = "store-v5.db";
+/// The same for a history in format 6, before worktree Tries (schema 7).
+pub const ROLLBACK_COPY_V6: &str = "store-v6.db";
+/// Every copy kept for older Asqu versions.
+pub const ROLLBACK_COPIES: &[&str] = &[ROLLBACK_COPY, ROLLBACK_COPY_V6];
 /// Any tool can write the person's request here (`asqu intent "…"`). Every save while
 /// that task is going on uses it as the "why", until it's replaced, cleared by a manual
 /// `asqu save`, or goes stale.
@@ -137,16 +141,17 @@ pub struct Store {
 impl Store {
     /// Finds the nearest folder at or above `start` that already has a store.
     ///
-    /// Never looks past the edge of a working copy (a folder with its own `.git`, such as a
-    /// git worktree an AI tool made inside the project): a separate copy of the project is
-    /// its own project, so its edits are never recorded into, or lost in, another history.
+    /// Never looks past the edge of a working copy (a folder with its own `.git`): a
+    /// separate copy of the project is never recorded into a history further up. The one
+    /// exception is a confirmed git worktree of a project that has a store (see
+    /// `worktree`): its work is recorded there, as a Try.
     pub fn find_root(start: &Path) -> Option<PathBuf> {
         for dir in start.ancestors() {
             if dir.join(DIR).join("store.db").is_file() {
                 return Some(dir.to_path_buf());
             }
             if is_working_copy(dir) {
-                return None;
+                return crate::worktree::main_of(dir).filter(|main| main.join(DIR).join("store.db").is_file());
             }
         }
         None
@@ -154,11 +159,56 @@ impl Store {
 
     /// Opens the store for `start`, creating one silently if none exists: at the top of the
     /// working copy `start` is in (a git project or worktree), or in `start` itself.
+    ///
+    /// Inside a git worktree of another project (one an AI tool made to work in, say), the
+    /// store is the main project's, and the worktree is one of its Tries. When that can't be
+    /// set up (no git, no shared starting point), the worktree is a project of its own.
     pub fn open_or_create(start: &Path) -> Result<Store> {
-        let root = Self::find_root(start)
-            .or_else(|| start.ancestors().find(|d| is_working_copy(d)).map(Path::to_path_buf))
-            .unwrap_or_else(|| start.to_path_buf());
-        Self::open_at(&root)
+        let own = start.ancestors().find_map(|dir| {
+            if dir.join(DIR).join("store.db").is_file() {
+                Some(Some(dir.to_path_buf()))
+            } else if is_working_copy(dir) {
+                Some(None)
+            } else {
+                None
+            }
+        });
+        if let Some(Some(root)) = own {
+            return Self::open_at(&root);
+        }
+        let top = start.ancestors().find(|d| is_working_copy(d)).map(Path::to_path_buf);
+        if let Some(top) = &top {
+            if let Some(main) = crate::worktree::main_of(top) {
+                if let Some(store) = Self::open_for_worktree(&main, top)? {
+                    return Ok(store);
+                }
+            }
+        }
+        Self::open_at(&top.unwrap_or_else(|| start.to_path_buf()))
+    }
+
+    /// Opens the main project's store for a confirmed worktree, linking the worktree as a
+    /// Try the first time. `None` when it can't be a Try (the worktree is then a project of
+    /// its own): nothing is created in that case. A link that fails part-way is an error,
+    /// not a reason to start a separate history; the next command tries again.
+    fn open_for_worktree(main: &Path, top: &Path) -> Result<Option<Store>> {
+        let top = top.canonicalize()?;
+        // The main project's history must be its own: not one kept in a folder above it.
+        let has_store = main.join(DIR).join("store.db").is_file();
+        if !has_store && Self::find_root(main).is_some() {
+            return Ok(None);
+        }
+        if has_store {
+            let store = Self::open_at(main)?;
+            if store.worktree_try(&top)?.is_some() {
+                return Ok(Some(store));
+            }
+        }
+        // Before anything is created: can git say where this worktree started?
+        let Ok(commit) = crate::worktree::base_commit(&top, main) else { return Ok(None) };
+        let mut store = Self::open_at(main)?;
+        store.link_worktree(&top, &commit)?;
+        Ok(Some(store))
     }
 
     pub fn open_at(root: &Path) -> Result<Store> {
@@ -280,7 +330,7 @@ impl Store {
             )?;
         }
         if (1..6).contains(&version) {
-            self.keep_rollback_copy()?;
+            self.keep_rollback_copy(ROLLBACK_COPY, 6)?;
         }
         if version < 6 {
             // Several processes can open an old store at once: only the first upgrades it.
@@ -332,6 +382,30 @@ impl Store {
                 tx.commit()?;
             }
         }
+        // Format 7: a Try can be a git worktree (a folder of its own, outside `.asqu`), with
+        // its starting point stored as a set of files instead of a Timeline entry.
+        let reached: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if reached == 6 {
+            // A history that was already in format 6 (not one made or upgraded just now, which
+            // has its own copy or nothing to copy): keep a copy an older Asqu can read.
+            if version == 6 {
+                self.keep_rollback_copy(ROLLBACK_COPY_V6, 7)?;
+            }
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            let now: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if now == 6 {
+                tx.execute_batch(
+                    "
+                    -- For a Try that is a git worktree: its folder. NULL for a Try in `.asqu/tries`.
+                    ALTER TABLE tries ADD COLUMN path TEXT;
+                    -- Where the Try started, as a stored set of files. NULL: the entry `base_seq`.
+                    ALTER TABLE tries ADD COLUMN base BLOB;
+                    PRAGMA user_version = 7;
+                    ",
+                )?;
+            }
+            tx.commit()?;
+        }
         // Histories made by early test builds of format 6 lack this column.
         let has_checked: bool = self
             .conn
@@ -353,9 +427,9 @@ impl Store {
     /// Asqu versions can read. If another process upgrades the history while this copy is
     /// being made, the copy comes out in the new format and is thrown away (that process
     /// kept its own copy first).
-    fn keep_rollback_copy(&self) -> Result<()> {
+    fn keep_rollback_copy(&self, name: &str, new_format: i64) -> Result<()> {
         let dir = self.root.join(DIR);
-        let dest = dir.join(ROLLBACK_COPY);
+        let dest = dir.join(name);
         let mut r = [0u8; 8];
         getrandom::getrandom(&mut r).map_err(|e| anyhow::anyhow!("{e}"))?;
         let tmp = dir.join(format!(".asqu-copy-{}.tmp", hash::hex(&r)));
@@ -365,7 +439,7 @@ impl Store {
         }
         let old_format = Connection::open(&tmp)
             .and_then(|c| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)))
-            .is_ok_and(|v| v < 6);
+            .is_ok_and(|v| v < new_format);
         // Replaces any copy from an earlier upgrade: this one is the latest old-format history.
         let result = if old_format { fs::rename(&tmp, &dest).context("keeping a copy of the history") } else { Ok(()) };
         let _ = fs::remove_file(&tmp);
@@ -737,7 +811,7 @@ impl Store {
         Ok(self.head_manifest()?.into_keys().collect())
     }
 
-    fn head_manifest(&self) -> Result<Manifest> {
+    pub(crate) fn head_manifest(&self) -> Result<Manifest> {
         match self.head()? {
             Some((_, _, mh)) => Self::decode_manifest(&self.get_blob(&mh)?),
             None => Ok(Manifest::new()),
@@ -1408,7 +1482,7 @@ fn refuse_linked_folder(dir: &Path) -> Result<()> {
 
 /// Refuses a `.asqu` folder (or the folders and files Asqu writes in it) that is a link.
 fn refuse_planted_links(dir: &Path) -> Result<()> {
-    for name in ["", "large", "tries", "store.db", "store.db-wal", "store.db-shm", ROLLBACK_COPY] {
+    for name in ["", "large", "tries", "store.db", "store.db-wal", "store.db-shm", ROLLBACK_COPY, ROLLBACK_COPY_V6] {
         let p = if name.is_empty() { dir.to_path_buf() } else { dir.join(name) };
         if fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
             bail!(

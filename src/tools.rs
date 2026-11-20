@@ -85,7 +85,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asqu_try_start",
-            description: "Start a Try: a separate copy of the project to attempt a change safely. Returns the folder to work in. Several Tries can run at once (e.g. one per AI for the same request; compare them with asqu_try_compare).",
+            description: "Start a Try: a separate copy of the project to attempt a change safely. Returns the folder to work in. Not needed inside a git worktree: Asqu already records a worktree as a Try of the main project (see asqu_try_list). Several Tries can run at once (e.g. one per AI for the same request; compare them with asqu_try_compare).",
             parameters: json!({ "type": "object", "properties": {
                 "name": { "type": "string", "description": "Short name, e.g. \"blue-header\" (letters, numbers, - and _, up to 40; not \"main\")." },
                 "why": { "type": "string", "description": "What this Try is for." }
@@ -110,6 +110,16 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "asqu_try_toss",
             description: "Throw a Try away. It can be brought back with asqu_try_reopen for 7 days.",
             parameters: json!({ "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] }),
+        },
+        ToolDef {
+            name: "asqu_try_update",
+            description: "Bring a Try up to date: combines what changed in the main project since the Try started into the Try's folder. The main project is not changed. If both sides changed the same lines, nothing is changed and the result lists \"questions\" per file: ask the person which version to keep, then call again with \"take\". Use dry_run to see what would change first.",
+            parameters: json!({ "type": "object", "properties": {
+                "name": { "type": "string" },
+                "dry_run": { "type": "boolean", "description": "Show what would change, without changing anything." },
+                "take": { "type": "object", "additionalProperties": { "type": "string", "enum": ["try", "main"] },
+                    "description": "After a clash: which version to keep per file, e.g. {\"app.js\": \"try\"}." }
+            }, "required": ["name"] }),
         },
         ToolDef {
             name: "asqu_try_reopen",
@@ -216,6 +226,9 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
     let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
     let n = |k: &str| args.get(k).and_then(Value::as_i64);
     let dry = args.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+    // Called from inside a Try's folder (a git worktree linked as a Try, say): saving and
+    // requests belong to that Try, and nothing here changes the main project by surprise.
+    let here = store.try_for_path(root);
 
     match name {
         "asqu_status" => Ok(changes_json(&store.status()?)),
@@ -234,6 +247,18 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
                     .collect(),
             ))
         }
+        "asqu_save" if here.is_some() => {
+            let name = here.unwrap_or_default();
+            let why = Why { request: s("why").unwrap_or_default(), ..caller(actor) };
+            let c = store.save_try(&name, &why)?;
+            Ok(json!({ "saved_in_try": name, "files_changed": c.count(),
+                "next": format!("This folder is Try \"{name}\". When it's good, call asqu_try_keep.") }))
+        }
+        "asqu_set_intent" if here.is_some() => {
+            store.set_try_intent(&here.unwrap_or_default(), &s("request").unwrap_or_default())?;
+            Ok(json!({ "ok": true }))
+        }
+        "asqu_undo" | "asqu_back" if here.is_some() => bail!("{}", store.main_only_note(&here.unwrap_or_default())),
         "asqu_save" => {
             let why = Why { request: s("why").unwrap_or_default(), ..caller(actor) };
             let r = store.save(&why)?;
@@ -296,7 +321,8 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
                 .list_tries()?
                 .into_iter()
                 .map(|t| json!({ "name": t.name, "status": t.status, "from": t.base_seq,
-                    "files_changed": t.changed, "why": t.request, "folder": t.path.display().to_string() }))
+                    "files_changed": t.changed, "why": t.request, "folder": t.path.display().to_string(),
+                    "worktree": t.worktree, "folder_gone": t.folder_gone }))
                 .collect(),
         )),
         "asqu_try_keep" => {
@@ -327,6 +353,23 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
             let name = s("name").context("\"name\" is required")?;
             store.toss_try(&name, actor)?;
             Ok(json!({ "tossed": name }))
+        }
+        "asqu_try_update" => {
+            use crate::tries::UpdateOutcome;
+            let name = s("name").context("\"name\" is required")?;
+            Ok(match store.update_try(&name, &take_arg(args)?, dry, actor)? {
+                UpdateOutcome::UpToDate => json!({ "status": "up_to_date", "name": name }),
+                UpdateOutcome::Updated { changes, dry_run } => {
+                    let mut v = changes_json(&changes);
+                    v["status"] = json!(if dry_run { "would_update" } else { "updated" });
+                    v["name"] = json!(name);
+                    v
+                }
+                UpdateOutcome::Clash { files, questions } => json!({ "status": "clash", "files": files,
+                    "questions": questions.iter().map(|q| json!({ "file": q.path, "what": q.what,
+                        "parts": q.parts.iter().map(|p| json!({ "line": p.line, "main": p.main, "try": p.try_text })).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+                    "next": "Both sides changed these differently, so nothing was changed. Ask the person which to keep for each file, then retry with take: {\"<file>\": \"try\" or \"main\"}." }),
+            })
         }
         other => bail!("unknown tool \"{other}\""),
     }

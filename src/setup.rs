@@ -62,6 +62,9 @@ If you can't run commands, write the request to `.asqu/intent` before editing in
   show the person, then run it without `--dry-run`.
 - For a big or risky change, use a Try: `asqu try start <name> -w \"<request>\"`, work in the
   folder it prints, then `asqu try keep <name>`.
+- Working in a git worktree? It is already a Try of the main project, named after its folder:
+  don't start another. Save as usual; `asqu try keep` there combines the work into the main
+  project, and `asqu try update` brings in what changed in the main project meanwhile.
 - Never pass `--yes` or `--trust-check` yourself. Those are the person's decisions.
 <!-- asqu:end -->
 ";

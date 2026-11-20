@@ -29,5 +29,6 @@ pub mod update;
 pub mod trust;
 pub mod watch;
 pub mod when;
+pub mod worktree;
 
 pub use store::{SaveReport, Store, Why};
