@@ -46,30 +46,66 @@ fn names_another_computer(path: &str) -> bool {
         [] => false,
         [first, ..] if !sep(*first) => !path.contains(':') || drive(0), // relative, or a drive
         [_] => true,                                                   // the top of this computer's files
-        [_, second, ..] if !sep(*second) => *second != '?' && *second != '.', // `/home/…`, never `\??\…`
+        // `/home/…`. Of the `\??\…` forms, only a drive (`\??\C:\…`, as Windows writes a
+        // junction to a folder on this computer).
+        [_, second, ..] if !sep(*second) => {
+            (*second != '?' && *second != '.') || (c.len() > 3 && c[1] == '?' && c[2] == '?' && sep(c[3]) && drive(4))
+        }
         _ => c.len() > 3 && c[2] == '?' && sep(c[3]) && drive(4),         // only `\\?\C:\…`
     };
     !local
 }
 
-/// Is anything on the way from `top` down to `path` a link (or a Windows junction)? Inside
-/// a folder that may have been downloaded, a link could lead anywhere, another computer
-/// included, so pointers are never followed through one.
-fn passes_through_a_link(top: &Path, path: &Path) -> bool {
-    let mut at = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::ParentDir => {
-                at.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => at.push(other.as_os_str()),
-        }
-        if at.starts_with(top) && at != top && fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
-            return true;
-        }
+/// Works out where a pointer leads, one step at a time, without ever stepping onto
+/// another computer. `pointer` is as written in the file; a relative one starts at `base`.
+///
+/// Letting the system resolve the whole path at once would follow any link on the way,
+/// and a link inside a downloaded folder (or a folder beside it) can lead anywhere. So
+/// each part is looked at first: where it is a link (or a Windows junction), the place
+/// the link names is held to the same rule as the pointer itself before it is followed.
+/// The answer is a real folder or file on this computer, in its standard form.
+fn follow_locally(base: &Path, pointer: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    if names_another_computer(pointer) {
+        return None;
     }
-    false
+    let mut todo: Vec<std::ffi::OsString> =
+        base.join(pointer).components().rev().map(|c| c.as_os_str().to_os_string()).collect();
+    let mut at = PathBuf::new();
+    let mut links = 0;
+    while let Some(part) = todo.pop() {
+        match Path::new(&part).components().next()? {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                at.pop();
+                continue;
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                at.push(&part);
+                continue;
+            }
+            Component::Normal(_) => {}
+        }
+        let next = at.join(&part);
+        let meta = fs::symlink_metadata(&next).ok()?;
+        if !meta.file_type().is_symlink() {
+            at = next;
+            continue;
+        }
+        links += 1;
+        let target = fs::read_link(&next).ok()?;
+        if links > 40 || names_another_computer(&target.to_string_lossy()) {
+            return None;
+        }
+        // Carry on from where the link leads (relative ones start beside the link).
+        if target.is_absolute() {
+            at = PathBuf::new();
+        }
+        todo.extend(target.components().rev().map(|c| c.as_os_str().to_os_string()));
+    }
+    // No links are left in it, so the system can now safely put it in its one standard
+    // form (the form every other folder here is compared in).
+    at.canonicalize().ok().filter(|p| !resolved_elsewhere(p))
 }
 
 /// On Windows: did a path, once worked out in full, turn out to be on another computer?
@@ -79,11 +115,6 @@ fn resolved_elsewhere(path: &Path) -> bool {
         path.components().next(),
         Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..))
     )
-}
-
-/// A pointer file's contents, when it names a place on this computer.
-fn local_pointer(path: &Path) -> Option<String> {
-    read_pointer(path).filter(|p| !names_another_computer(p))
 }
 
 /// If `top` is a git worktree of another project, confirmed from both sides, returns that
@@ -114,8 +145,9 @@ pub fn identity(top: &Path) -> Option<String> {
 /// main project (git updates that when the worktree is moved).
 pub fn find_by_identity(main: &Path, id: &str) -> Option<PathBuf> {
     let name = id.split('|').next().filter(|n| !n.is_empty() && !n.contains(['/', '\\']) && *n != "." && *n != "..")?;
-    let pointer = local_pointer(&main.join(".git").join("worktrees").join(name).join("gitdir"))?;
-    let top = Path::new(&pointer).parent()?.canonicalize().ok()?;
+    let entry = main.join(".git").join("worktrees").join(name);
+    let dot_git = follow_locally(&entry, &read_pointer(&entry.join("gitdir"))?)?;
+    let top = dot_git.parent()?.to_path_buf();
     (main_of(&top).as_deref() == Some(main) && identity(&top).as_deref() == Some(id)).then_some(top)
 }
 
@@ -125,21 +157,20 @@ fn confirm(top: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = top.join(".git");
     let pointer = read_pointer(&dot_git)?;
     let gitdir = pointer.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
-    // Never follow a pointer to another computer: just looking there would contact it.
-    if names_another_computer(gitdir) || passes_through_a_link(top, &top.join(gitdir)) {
-        return None;
-    }
     // Relative paths are relative to the worktree; an absolute one replaces it.
-    let admin = top.join(gitdir).canonicalize().ok().filter(|p| !resolved_elsewhere(p))?;
-    let common = admin.join(local_pointer(&admin.join("commondir"))?).canonicalize().ok().filter(|p| !resolved_elsewhere(p))?;
+    // Every pointer is followed one checked step at a time (`follow_locally`): never onto
+    // another computer, where only looking would contact it.
+    let top = &follow_locally(top, ".")?;
+    let admin = follow_locally(top, gitdir)?;
+    let common = follow_locally(&admin, &read_pointer(&admin.join("commondir"))?)?;
     // The worktree's entry must really sit inside the main project's git folder: that is
     // the one place a faked worktree can't write.
     if admin.parent()? != common.join("worktrees") {
         return None;
     }
     // And it must name this worktree back.
-    let back = admin.join(local_pointer(&admin.join("gitdir"))?).canonicalize().ok()?;
-    if back != dot_git.canonicalize().ok()? {
+    let back = follow_locally(&admin, &read_pointer(&admin.join("gitdir"))?)?;
+    if back != top.join(".git") {
         return None;
     }
     // The main project is the folder holding that git folder as its own `.git`.
@@ -147,7 +178,7 @@ fn confirm(top: &Path) -> Option<(PathBuf, PathBuf)> {
         return None;
     }
     let main = common.parent()?.to_path_buf();
-    if main == top.canonicalize().ok()? {
+    if main == *top {
         return None;
     }
     Some((main, admin))
@@ -466,14 +497,13 @@ mod tests {
             r"/\server\share",
             r"\\?\GLOBALROOT\x",
             r"\??\UNC\server\share",
-            r"\??\C:\x",
             r"/.\x",
             "http://server/x",
             "",
         ] {
             assert!(names_another_computer(remote), "{remote}");
         }
-        for local in ["/home/me/project/.git/worktrees/a", "C:/Users/me/p/.git", r"C:\Users\me", "../..", r"\\?\C:\Users\me", "/", ".git/worktrees/a"] {
+        for local in ["/home/me/project/.git/worktrees/a", "C:/Users/me/p/.git", r"C:\Users\me", "../..", r"\\?\C:\Users\me", r"\??\C:\x", "/", ".git/worktrees/a"] {
             assert!(!names_another_computer(local), "{local}");
         }
     }

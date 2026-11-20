@@ -582,6 +582,33 @@ fn moving_the_main_project_keeps_each_worktrees_try() {
     assert!(list.contains("2 file(s) changed") && !list.contains("beside-2") && !list.contains("was removed"), "{list}");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_pointer_is_never_followed_through_a_link_to_another_computer() {
+    use std::os::unix::fs::symlink;
+    let (t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let real = worktree(&main, &home, "real");
+    // A link on this computer on the way is fine: the worktree is reached through one.
+    let through = t.path().join("shortcut");
+    symlink(&real, &through).unwrap();
+    assert_eq!(asqu::worktree::main_of(&through), Some(main.canonicalize().unwrap()));
+
+    // A downloaded folder whose pointer goes through a link that names another computer:
+    // refused before anything is looked up there.
+    let fake = t.path().join("downloaded");
+    fs::create_dir_all(&fake).unwrap();
+    symlink("//elsewhere.invalid/share/entry", fake.join("hop")).unwrap();
+    fs::write(fake.join(".git"), "gitdir: hop\n").unwrap();
+    assert_eq!(asqu::worktree::main_of(&fake), None);
+    // The same with the link in a folder beside it.
+    let beside = t.path().join("beside");
+    fs::create_dir_all(&beside).unwrap();
+    symlink("//elsewhere.invalid/share", beside.join("hop")).unwrap();
+    fs::write(fake.join(".git"), "gitdir: ../beside/hop/entry\n").unwrap();
+    assert_eq!(asqu::worktree::main_of(&fake), None);
+}
+
 #[test]
 fn a_receipt_checked_in_a_worktree_is_checked_against_the_files_there() {
     let (_t, home, main) = project();
