@@ -553,7 +553,19 @@ fn claude_md_hint(root: &std::path::Path) {
 /// The named Try, or the one whose folder we're in.
 fn pick_try(store: &Store, name: Option<String>) -> Result<String> {
     match name {
-        Some(n) => Ok(n),
+        // A worktree's Try is named after its folder, tidied up: the folder's own name
+        // (or path) is accepted too.
+        Some(n) => Ok(store
+            .list_tries()
+            .ok()
+            .filter(|all| !all.iter().any(|t| t.name == n))
+            .and_then(|all| {
+                let asked = std::path::Path::new(&n);
+                all.into_iter()
+                    .find(|t| t.worktree && (t.path == asked || t.path.file_name().is_some_and(|f| f == asked.as_os_str())))
+                    .map(|t| t.name)
+            })
+            .unwrap_or(n)),
         None => store
             .try_for_path(&std::env::current_dir()?)
             .context("Which Try? Give its name (see `asqu try list`), or run this inside its folder."),
@@ -1694,6 +1706,18 @@ fn main() -> Result<()> {
                     println!("  removed   {p}");
                 }
                 println!("{} file(s) changed.", c.count());
+            }
+            let open: Vec<_> = store.list_tries()?.into_iter().filter(|t| t.status == "open").collect();
+            if !open.is_empty() {
+                let names: Vec<String> = open
+                    .iter()
+                    .map(|t| if t.folder_gone { format!("{} (folder removed)", t.name) } else { t.name.clone() })
+                    .collect();
+                println!(
+                    "{}: {}. See `asqu try list`.",
+                    if open.len() == 1 { "1 open Try".to_string() } else { format!("{} open Tries", open.len()) },
+                    printable(&names.join(", "))
+                );
             }
             for line in asqu::backup::status_lines(store.root()) {
                 println!("{line}");

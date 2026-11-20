@@ -137,7 +137,7 @@ pub struct KeepOptions {
 }
 
 /// A Try's row as stored: starting entry, status, request, files, folder, starting point.
-type StoredRow = (i64, String, String, Vec<u8>, Option<String>, Option<Vec<u8>>);
+type StoredRow = (i64, String, String, Vec<u8>, Option<String>, Option<Vec<u8>>, Option<String>);
 
 pub(crate) struct Row {
     pub base_seq: i64,
@@ -146,6 +146,9 @@ pub(crate) struct Row {
     pub manifest: Hash,
     /// For a git worktree linked as a Try: its folder.
     pub path: Option<PathBuf>,
+    /// Which worktree that is (`worktree::identity`). A folder is only this Try's while
+    /// it holds that same worktree.
+    pub wt_id: Option<String>,
     /// Where the Try started, as a stored set of files (None: the entry `base_seq`).
     pub base: Option<Hash>,
 }
@@ -195,7 +198,11 @@ impl Store {
     pub(crate) fn folder_ok(&self, row: &Row) -> bool {
         match &row.path {
             None => true,
-            Some(p) => crate::worktree::main_of(p).is_some_and(|main| main == self.root()),
+            Some(p) => {
+                crate::worktree::main_of(p).is_some_and(|main| main == self.root())
+                    && row.wt_id.is_some()
+                    && crate::worktree::identity(p) == row.wt_id
+            }
         }
     }
 
@@ -208,13 +215,21 @@ impl Store {
     }
 
     /// The Try a linked worktree is recorded as, if it has been linked. `top` is the
-    /// worktree's top folder in its full, real form.
+    /// worktree's top folder in its full, real form. A worktree is known by what it is,
+    /// not where: one that was moved keeps its Try (the new folder is noted), and a new
+    /// worktree made where an old one used to be is a new Try, never the old one's.
     pub(crate) fn worktree_try(&self, top: &Path) -> Result<Option<String>> {
-        Ok(self
+        let Some(id) = crate::worktree::identity(top) else { return Ok(None) };
+        let found: Option<(String, Option<String>)> = self
             .conn
-            .query_row("SELECT name FROM tries WHERE path = ?1", [top.to_string_lossy()], |r| r.get::<_, String>(0))
-            .optional()?
-            .filter(|n| valid_name(n).is_ok()))
+            .query_row("SELECT name, path FROM tries WHERE wt_id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((name, path)) = found.filter(|(n, _)| valid_name(n).is_ok()) else { return Ok(None) };
+        let here = top.to_string_lossy();
+        if path.as_deref() != Some(&*here) {
+            self.conn.execute("UPDATE tries SET path = ?1 WHERE name = ?2", params![here, name])?;
+        }
+        Ok(Some(name))
     }
 
     /// The Try whose folder contains `path`, if any: an open Try inside `.asqu`, or a
@@ -237,28 +252,29 @@ impl Store {
         valid_name(name)?; // never build a folder path from an unsafe name, wherever it came from
         self.conn
             .query_row(
-                "SELECT base_seq, status, request, manifest, path, base FROM tries WHERE name = ?1",
+                "SELECT base_seq, status, request, manifest, path, base, wt_id FROM tries WHERE name = ?1",
                 [name],
                 |r| {
                     let m: Vec<u8> = r.get(3)?;
                     let path: Option<String> = r.get(4)?;
                     let base: Option<Vec<u8>> = r.get(5)?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, m, path, base))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, m, path, base, r.get(6)?))
                 },
             )
             .optional()?
-            .map(|(base_seq, status, request, m, path, base): StoredRow| {
+            .map(|(base_seq, status, request, m, path, base, wt_id): StoredRow| {
                 Ok::<_, anyhow::Error>(Row {
                     base_seq,
                     status,
                     request,
                     manifest: hash::from_slice(&m).context("bad hash")?,
                     path: path.map(PathBuf::from),
+                    wt_id,
                     base: base.map(|b| hash::from_slice(&b).context("bad hash")).transpose()?,
                 })
             })
             .transpose()?
-            .with_context(|| format!("there's no Try called \"{name}\""))
+            .with_context(|| format!("there's no Try called \"{name}\" (see `asqu try list`)"))
     }
 
     /// Links a confirmed git worktree as a Try of this project, starting from `commit`
@@ -325,11 +341,11 @@ impl Store {
         )?;
         store_batch(self, &mut batch, &mut base)?;
 
+        let id = crate::worktree::identity(top).context("this folder is no longer a Git worktree of the project")?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // Another command may have linked it while the files were being read.
-        let linked: Option<String> = tx
-            .query_row("SELECT name FROM tries WHERE path = ?1", [top.to_string_lossy()], |r| r.get(0))
-            .optional()?;
+        let linked: Option<String> =
+            tx.query_row("SELECT name FROM tries WHERE wt_id = ?1", [&id], |r| r.get(0)).optional()?;
         if let Some(name) = linked {
             tx.commit()?;
             return Ok(name);
@@ -345,9 +361,9 @@ impl Store {
         let mh = self.put_blob_near(&tx, &Store::encode_manifest(&base), None)?;
         let base_seq: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM timeline", [], |r| r.get(0))?;
         tx.execute(
-            "INSERT INTO tries (name, base_seq, created, status, request, manifest, path, base)
-             VALUES (?1, ?2, ?3, 'open', '', ?4, ?5, ?4)",
-            params![name, base_seq, chrono::Utc::now().timestamp(), &mh[..], top.to_string_lossy()],
+            "INSERT INTO tries (name, base_seq, created, status, request, manifest, path, base, wt_id)
+             VALUES (?1, ?2, ?3, 'open', '', ?4, ?5, ?4, ?6)",
+            params![name, base_seq, chrono::Utc::now().timestamp(), &mh[..], top.to_string_lossy(), id],
         )?;
         tx.commit()?;
         Ok(name)
@@ -426,7 +442,7 @@ impl Store {
     fn open_try(&self, name: &str) -> Result<Row> {
         let row = self.try_row(name)?;
         if row.status != "open" {
-            bail!("Try \"{name}\" was already {}", row.status);
+            bail!("Try \"{name}\" was already {} (see `asqu try list`)", row.status);
         }
         Ok(row)
     }
@@ -448,7 +464,7 @@ impl Store {
         )?;
         // A worktree's folder named in a backup is never used: on this computer it may be
         // someone else's folder, or nothing. Such a Try is brought back as an ordinary one.
-        self.conn.execute("UPDATE tries SET path = NULL", [])?;
+        self.conn.execute("UPDATE tries SET path = NULL, wt_id = NULL", [])?;
         // Replaces whatever list came in the backup: that list isn't signed either.
         self.set_meta(SET_ASIDE_META, &serde_json::to_string(&list("tossed")?)?)?;
         Ok(open)
@@ -662,7 +678,7 @@ impl Store {
             // A worktree's folder is never rewritten: it is open again just as it stands.
             if !self.folder_ok(&row) {
                 bail!(
-                    "Try \"{name}\" was a git worktree at {}, and that folder is gone, so it can't be brought back",
+                    "Try \"{name}\" was a Git worktree at {}, and that folder is gone, so it can't be brought back",
                     path.display()
                 );
             }
@@ -860,7 +876,8 @@ impl Store {
         let row = self.open_try(name)?;
         if !self.folder_ok(&row) {
             bail!(
-                "Try \"{name}\" is a git worktree whose folder is gone ({}), so there is nothing to bring up to date",
+                "Try \"{name}\" is a Git worktree whose folder is gone ({}), so there is nothing to bring up to date.\n\
+                 Asqu still has its work as last saved: keep that with `asqu try keep {name}`, or drop it with `asqu try toss {name}`.",
                 self.try_dir(name).display()
             );
         }

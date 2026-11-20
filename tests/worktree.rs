@@ -281,7 +281,7 @@ fn a_format_6_history_is_upgraded_with_its_tries_and_a_copy_for_older_asqu() {
     // As Asqu 0.1.0 left it.
     rusqlite::Connection::open(main.join(".asqu/store.db"))
         .unwrap()
-        .execute_batch("ALTER TABLE tries DROP COLUMN path; ALTER TABLE tries DROP COLUMN base; PRAGMA user_version = 6;")
+        .execute_batch("ALTER TABLE tries DROP COLUMN path; ALTER TABLE tries DROP COLUMN base; ALTER TABLE tries DROP COLUMN wt_id; PRAGMA user_version = 6;")
         .unwrap();
 
     let list = run(&main, &home, ASQU, &["try", "list"]);
@@ -558,6 +558,56 @@ fn line_endings_git_changes_never_cause_a_clash() {
     let kept = run(&main, &home, ASQU, &["try", "keep", "endings", "--no-check"]);
     assert!(kept.contains("Kept Try"), "{kept}");
     assert_eq!(text(&main.join("lines.txt")), "one (main)\ntwo\nthree\nfour\nfive (try)\n");
+}
+
+#[test]
+fn a_new_worktree_where_an_old_one_was_is_a_new_try() {
+    let (_t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "task");
+    fs::write(wt.join("app.txt"), "one\ntwo, improved\nthree\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "First"]);
+    run(&main, &home, ASQU, &["try", "keep", "task", "--no-check"]);
+    assert_eq!(text(&main.join("app.txt")), "one\ntwo, improved\nthree\n");
+
+    // The AI tool removes its worktree and later makes another in the same place.
+    run(&main, &home, "git", &["worktree", "remove", "--force", ".claude/worktrees/task"]);
+    run(&main, &home, "git", &["branch", "-D", "task"]);
+    run(&main, &home, "git", &["worktree", "add", "-q", ".claude/worktrees/task", "-b", "task-again"]);
+    fs::write(wt.join("feature.txt"), "feature\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "Second"]);
+
+    // A Try of its own, starting from git afresh: keeping it adds its work and nothing else.
+    let list = run(&main, &home, ASQU, &["try", "list"]);
+    assert!(list.contains("task-2") && list.contains("1 file(s) changed"), "{list}");
+    let kept = run(&wt, &home, ASQU, &["try", "keep", "--no-check"]);
+    assert!(kept.contains("Kept Try \"task-2\"") && !kept.contains("app.txt"), "{kept}");
+    assert_eq!(text(&main.join("app.txt")), "one\ntwo, improved\nthree\n", "the earlier kept work stays");
+    assert_eq!(text(&main.join("feature.txt")), "feature\n");
+}
+
+#[test]
+fn a_moved_worktree_keeps_its_try_and_its_folder_name_finds_it() {
+    let (t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    run(&main, &home, "git", &["worktree", "add", "-q", ".claude/worktrees/odd name (v2)", "-b", "odd"]);
+    let wt = main.join(".claude/worktrees/odd name (v2)");
+    fs::write(wt.join("other.txt"), "changed\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "Change"]);
+    let list = run(&main, &home, ASQU, &["try", "list"]);
+    assert!(list.contains("odd-name-v2"), "{list}");
+    assert!(run(&main, &home, ASQU, &["status"]).contains("1 open Try: odd-name-v2"));
+
+    let moved = t.path().join("moved here");
+    run(&main, &home, "git", &["worktree", "move", ".claude/worktrees/odd name (v2)", moved.to_str().unwrap()]);
+    fs::write(moved.join("app.txt"), "more\n").unwrap();
+    run(&moved, &home, ASQU, &["save", "-w", "More"]);
+    let list = run(&main, &home, ASQU, &["try", "list"]);
+    assert!(list.contains("2 file(s) changed") && !list.contains("folder removed") && !list.contains("moved-here"), "{list}");
+    // The folder's own name works where the Try's name is asked for.
+    let kept = run(&main, &home, ASQU, &["try", "keep", "moved here", "--no-check"]);
+    assert!(kept.contains("Kept Try \"odd-name-v2\""), "{kept}");
+    assert_eq!(text(&main.join("app.txt")), "more\n");
 }
 
 #[test]

@@ -410,6 +410,9 @@ impl Store {
                     ALTER TABLE tries ADD COLUMN path TEXT;
                     -- Where the Try started, as a stored set of files. NULL: the entry `base_seq`.
                     ALTER TABLE tries ADD COLUMN base BLOB;
+                    -- Which worktree it is (see `worktree::identity`): the same after a move,
+                    -- different for a new worktree made later at the same place.
+                    ALTER TABLE tries ADD COLUMN wt_id TEXT;
                     PRAGMA user_version = 7;
                     ",
                 )?;

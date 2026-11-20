@@ -37,6 +37,27 @@ fn read_pointer(path: &Path) -> Option<String> {
 /// project itself, a submodule, a faked pointer, a worktree of a project with no folder
 /// of its own.
 pub fn main_of(top: &Path) -> Option<PathBuf> {
+    confirm(top).map(|(main, _)| main)
+}
+
+/// Which worktree this is, in a form that stays the same when the worktree is moved
+/// (`git worktree move`) and is different for a new worktree made later at the same place
+/// or under the same name: git's own entry for it, and when that entry was made.
+pub fn identity(top: &Path) -> Option<String> {
+    let (_, entry) = confirm(top)?;
+    // Written once, when git makes the worktree, and never again.
+    let made = fs::symlink_metadata(entry.join("commondir")).ok()?;
+    let when = made.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    #[cfg(unix)]
+    let file = std::os::unix::fs::MetadataExt::ino(&made);
+    #[cfg(not(unix))]
+    let file = made.len();
+    Some(format!("{}|{when}|{file}", entry.to_string_lossy()))
+}
+
+/// The main project's folder and git's own entry for the worktree, when `top` is a
+/// worktree confirmed from both sides.
+fn confirm(top: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = top.join(".git");
     let pointer = read_pointer(&dot_git)?;
     let gitdir = pointer.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
@@ -61,7 +82,7 @@ pub fn main_of(top: &Path) -> Option<PathBuf> {
     if main == top.canonicalize().ok()? {
         return None;
     }
-    Some(main)
+    Some((main, admin))
 }
 
 /// A git command that only reads: no prompts, no pager, none of the settings that point
@@ -278,11 +299,16 @@ pub fn same_but_line_endings(a: &[u8], b: &[u8]) -> bool {
 /// A Try name made from a worktree's folder name (letters, numbers, - and _, up to 40).
 pub fn try_name_for(top: &Path) -> String {
     let folder = top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut name: String = folder
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .take(40)
-        .collect();
+    let mut name = String::new();
+    for c in folder.chars() {
+        let c = if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' };
+        // One dash for any run of other characters.
+        if c == '-' && name.ends_with('-') {
+            continue;
+        }
+        name.push(c);
+    }
+    name.truncate(40);
     name = name.trim_matches('-').to_string();
     if name.is_empty() || name.eq_ignore_ascii_case("main") {
         name = "worktree".into();
@@ -299,6 +325,7 @@ mod tests {
         assert_eq!(try_name_for(Path::new("/x/.claude/worktrees/fix login!")), "fix-login");
         assert_eq!(try_name_for(Path::new("/x/main")), "worktree");
         assert_eq!(try_name_for(Path::new("/x/---")), "worktree");
+        assert_eq!(try_name_for(Path::new("/x/odd name (v2) & 'x'")), "odd-name-v2-x");
         assert!(usable_path("src/app.js"));
         for bad in ["../x", "/etc/passwd", "a//b", "a/./b", ".git/config", "src/.GIT/x", "node_modules/a.js", "a\\b", ""] {
             assert!(!usable_path(bad), "{bad}");
