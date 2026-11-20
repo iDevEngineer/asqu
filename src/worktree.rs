@@ -32,6 +32,25 @@ fn read_pointer(path: &Path) -> Option<String> {
     Some(fs::read_to_string(path).ok()?.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Does this path name a place on another computer (`\\\\server\\share`, `//server/share`, and
+/// the longer Windows ways of writing the same)? Only a drive on this computer written
+/// the long way (`\\\\?\\C:\\…`) starts like that and is local.
+fn names_another_computer(path: &str) -> bool {
+    let sep = |c: char| c == '/' || c == '\\';
+    let mut chars = path.chars();
+    if !(chars.next().is_some_and(sep) && chars.next().is_some_and(sep)) {
+        return false;
+    }
+    // `\\?\C:\…`: this computer's own drive.
+    let rest: Vec<char> = path.chars().skip(2).collect();
+    !(rest.len() >= 4 && rest[0] == '?' && sep(rest[1]) && rest[2].is_ascii_alphabetic() && rest[3] == ':')
+}
+
+/// A pointer file's contents, when it names a place on this computer.
+fn local_pointer(path: &Path) -> Option<String> {
+    read_pointer(path).filter(|p| !names_another_computer(p))
+}
+
 /// If `top` is a git worktree of another project, confirmed from both sides, returns that
 /// main project's folder (in its full, real form). `None` for anything else: the main
 /// project itself, a submodule, a faked pointer, a worktree of a project with no folder
@@ -60,7 +79,7 @@ pub fn identity(top: &Path) -> Option<String> {
 /// main project (git updates that when the worktree is moved).
 pub fn find_by_identity(main: &Path, id: &str) -> Option<PathBuf> {
     let name = id.split('|').next().filter(|n| !n.is_empty() && !n.contains(['/', '\\']) && *n != "." && *n != "..")?;
-    let pointer = read_pointer(&main.join(".git").join("worktrees").join(name).join("gitdir"))?;
+    let pointer = local_pointer(&main.join(".git").join("worktrees").join(name).join("gitdir"))?;
     let top = Path::new(&pointer).parent()?.canonicalize().ok()?;
     (main_of(&top).as_deref() == Some(main) && identity(&top).as_deref() == Some(id)).then_some(top)
 }
@@ -72,20 +91,19 @@ fn confirm(top: &Path) -> Option<(PathBuf, PathBuf)> {
     let pointer = read_pointer(&dot_git)?;
     let gitdir = pointer.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
     // Never follow a pointer to another computer: just looking there would contact it.
-    let remote = |p: &str| p.starts_with("\\\\") || p.starts_with("//");
-    if remote(gitdir) || read_pointer(&top.join(gitdir).join("commondir")).is_some_and(|c| remote(&c)) {
+    if names_another_computer(gitdir) {
         return None;
     }
     // Relative paths are relative to the worktree; an absolute one replaces it.
     let admin = top.join(gitdir).canonicalize().ok()?;
-    let common = admin.join(read_pointer(&admin.join("commondir"))?).canonicalize().ok()?;
+    let common = admin.join(local_pointer(&admin.join("commondir"))?).canonicalize().ok()?;
     // The worktree's entry must really sit inside the main project's git folder: that is
     // the one place a faked worktree can't write.
     if admin.parent()? != common.join("worktrees") {
         return None;
     }
     // And it must name this worktree back.
-    let back = admin.join(read_pointer(&admin.join("gitdir"))?).canonicalize().ok()?;
+    let back = admin.join(local_pointer(&admin.join("gitdir"))?).canonicalize().ok()?;
     if back != dot_git.canonicalize().ok()? {
         return None;
     }
@@ -400,6 +418,16 @@ mod tests {
         assert!(usable_path("src/app.js"));
         for bad in ["../x", "/etc/passwd", "a//b", "a/./b", ".git/config", "src/.GIT/x", "node_modules/a.js", "a\\b", ""] {
             assert!(!usable_path(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pointers_to_another_computer_are_never_followed() {
+        for remote in [r"\\server\share\x", "//server/share/x", r"\\?\UNC\server\share", r"\\.\pipe\x", r"/\server\share", r"\\?\GLOBALROOT\x"] {
+            assert!(names_another_computer(remote), "{remote}");
+        }
+        for local in ["/home/me/project/.git/worktrees/a", "C:/Users/me/p/.git", r"C:\Users\me", "../..", r"\\?\C:\Users\me"] {
+            assert!(!names_another_computer(local), "{local}");
         }
     }
 
