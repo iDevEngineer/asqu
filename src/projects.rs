@@ -40,8 +40,9 @@ fn exists(root: &Path) -> bool {
 /// project (a git worktree, e.g. by an AI tool), "main project · copy".
 pub fn name(root: &Path) -> String {
     let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let main = crate::store::worktree_common_git_dir(root)
-        .and_then(|git| git.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()));
+    // Only a worktree confirmed from both sides: a pointer anyone could have written is
+    // never followed (see `worktree::main_of`).
+    let main = crate::worktree::main_of(root).and_then(|m| m.file_name().map(|n| n.to_string_lossy().into_owned()));
     match main {
         Some(m) if m != folder => format!("{m} · {folder}"),
         _ => folder,

@@ -309,6 +309,14 @@ impl Store {
         if valid_name(asked).is_ok() && self.try_row(asked).is_ok() {
             return Ok(asked.to_string());
         }
+        // The same name in other capitals (names are unique whatever the capitals).
+        if valid_name(asked).is_ok() {
+            let other: Option<String> =
+                self.conn.query_row("SELECT name FROM tries WHERE name = ?1 COLLATE NOCASE", params![asked], |r| r.get(0)).optional()?;
+            if let Some(name) = other {
+                return Ok(name);
+            }
+        }
         let as_path = Path::new(asked).canonicalize().ok();
         let mut stmt = self.conn.prepare("SELECT name FROM tries WHERE path IS NOT NULL ORDER BY name")?;
         let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
@@ -320,6 +328,13 @@ impl Store {
                 })
             })
             .collect();
+        // Several: the one whose folder is really there now (an earlier Try of a worktree
+        // that was removed keeps the folder's name).
+        let live: Vec<&String> =
+            found.iter().filter(|n| self.try_row(n).is_ok_and(|r| r.status == "open" && self.folder_ok(&r))).collect();
+        if let ([_, _, ..], [one]) = (found.as_slice(), live.as_slice()) {
+            return Ok((*one).clone());
+        }
         match found.as_slice() {
             [one] => Ok(one.clone()),
             [] => Ok(asked.to_string()), // not a folder either: the usual "no Try called" follows
@@ -374,19 +389,24 @@ impl Store {
                         }
                     }
                 }
-                // Already edited in the worktree: its own line endings (or failing that, the
-                // main project's copy) show which kind git writes into folders here.
+                // Already edited in the worktree. The main project's copy shows which kind
+                // git writes into folders here; only when it has no copy does the worktree's
+                // own file say.
                 if !matched {
-                    let edited = fs::symlink_metadata(&here).ok().filter(|m| m.is_file()).and_then(|_| fs::read(&here).ok());
-                    let main = head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok());
-                    if let Some(converted) = edited.as_deref().and_then(|cur| crate::worktree::with_line_endings_of(&f.data, cur)) {
-                        f.data = converted;
-                    } else if let Some(main) = main.filter(|m| *m != f.data && crate::worktree::same_but_line_endings(m, &f.data)) {
-                        f.data = main;
-                    } else if let Some(converted) =
-                        head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()).and_then(|m| crate::worktree::with_line_endings_of(&f.data, &m))
-                    {
-                        f.data = converted;
+                    match head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()) {
+                        Some(main) if main == f.data => {}
+                        Some(main) if crate::worktree::same_but_line_endings(&main, &f.data) => f.data = main,
+                        Some(main) => {
+                            if let Some(converted) = crate::worktree::with_line_endings_of(&f.data, &main) {
+                                f.data = converted;
+                            }
+                        }
+                        None => {
+                            let edited = fs::symlink_metadata(&here).ok().filter(|m| m.is_file()).and_then(|_| fs::read(&here).ok());
+                            if let Some(converted) = edited.and_then(|cur| crate::worktree::with_line_endings_of(&f.data, &cur)) {
+                                f.data = converted;
+                            }
+                        }
                     }
                 }
                 batch_bytes += f.data.len();

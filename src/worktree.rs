@@ -48,10 +48,13 @@ fn names_another_computer(path: &str) -> bool {
         [_] => true,                                                   // the top of this computer's files
         // `/home/…`. Of the `\??\…` forms, only a drive (`\??\C:\…`, as Windows writes a
         // junction to a folder on this computer).
-        [_, second, ..] if !sep(*second) => {
-            (*second != '?' && *second != '.') || (c.len() > 3 && c[1] == '?' && c[2] == '?' && sep(c[3]) && drive(4))
+        [first, second, ..] if !sep(*second) => {
+            (*second != '?' && *second != '.')
+                || (*first == '\\' && *second == '?' && c.len() > 3 && c[2] == '?' && c[3] == '\\' && drive(4))
         }
-        _ => c.len() > 3 && c[2] == '?' && sep(c[3]) && drive(4),         // only `\\?\C:\…`
+        // Only `\\?\C:\…`, written with backslashes: with forward ones (`//?/C:/…`) Windows
+        // and this program read it differently.
+        _ => c[0] == '\\' && c[1] == '\\' && c.len() > 3 && c[2] == '?' && c[3] == '\\' && drive(4),
     };
     !local
 }
@@ -65,28 +68,30 @@ fn names_another_computer(path: &str) -> bool {
 /// the link names is held to the same rule as the pointer itself before it is followed.
 /// The answer is a real folder or file on this computer, in its standard form.
 fn follow_locally(base: &Path, pointer: &str) -> Option<PathBuf> {
-    use std::path::Component;
     if names_another_computer(pointer) {
         return None;
     }
-    let mut todo: Vec<std::ffi::OsString> =
-        base.join(pointer).components().rev().map(|c| c.as_os_str().to_os_string()).collect();
+    // Windows writes a folder's full form as `\\?\C:\…`, in which `/` isn't a separator:
+    // read the pointer against the plain form.
+    let mut todo = steps(&plain(base).join(pointer));
     let mut at = PathBuf::new();
     let mut links = 0;
-    while let Some(part) = todo.pop() {
-        match Path::new(&part).components().next()? {
-            Component::CurDir => continue,
-            Component::ParentDir => {
+    while let Some(step) = todo.pop() {
+        let name = match step {
+            Step::Up => {
                 at.pop();
                 continue;
             }
-            Component::Prefix(_) | Component::RootDir => {
-                at.push(&part);
+            Step::Top(top) => {
+                at.push(top);
                 continue;
             }
-            Component::Normal(_) => {}
+            Step::Name(name) => name,
+        };
+        if !plain_name(&name) {
+            return None;
         }
-        let next = at.join(&part);
+        let next = at.join(&name);
         let meta = fs::symlink_metadata(&next).ok()?;
         if !meta.file_type().is_symlink() {
             at = next;
@@ -94,18 +99,50 @@ fn follow_locally(base: &Path, pointer: &str) -> Option<PathBuf> {
         }
         links += 1;
         let target = fs::read_link(&next).ok()?;
-        if links > 40 || names_another_computer(&target.to_string_lossy()) {
+        let written = target.to_string_lossy();
+        if links > 40 || names_another_computer(&written) {
             return None;
         }
-        // Carry on from where the link leads (relative ones start beside the link).
-        if target.is_absolute() {
-            at = PathBuf::new();
-        }
-        todo.extend(target.components().rev().map(|c| c.as_os_str().to_os_string()));
+        // Carry on from where the link leads: a relative one starts beside the link, one
+        // from the top replaces what came before (its first step does that).
+        todo.extend(steps(&plain(Path::new(written.strip_prefix(r"\??\").unwrap_or(&written)))));
     }
     // No links are left in it, so the system can now safely put it in its one standard
     // form (the form every other folder here is compared in).
     at.canonicalize().ok().filter(|p| !resolved_elsewhere(p))
+}
+
+/// One step of a path, kept as what it was read as: a later part is never read again as
+/// if it were a whole path (on Windows, a part like `Z:` would then mean another drive).
+enum Step {
+    /// A drive, or the top of the files.
+    Top(std::ffi::OsString),
+    Up,
+    Name(std::ffi::OsString),
+}
+
+/// A path's steps, last first.
+fn steps(path: &Path) -> Vec<Step> {
+    use std::path::Component;
+    path.components()
+        .rev()
+        .filter_map(|c| match c {
+            Component::CurDir => None,
+            Component::ParentDir => Some(Step::Up),
+            Component::Prefix(_) | Component::RootDir => Some(Step::Top(c.as_os_str().to_os_string())),
+            Component::Normal(name) => Some(Step::Name(name.to_os_string())),
+        })
+        .collect()
+}
+
+/// Is this name read the same way by Windows as by this program? Windows drops a dot or
+/// space from the end of a name, and reads a `:` as more than part of a name.
+fn plain_name(name: &std::ffi::OsStr) -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    let name = name.to_string_lossy();
+    !(name.contains(':') || name.ends_with('.') || name.ends_with(' '))
 }
 
 /// On Windows: did a path, once worked out in full, turn out to be on another computer?
@@ -113,7 +150,8 @@ fn resolved_elsewhere(path: &Path) -> bool {
     use std::path::{Component, Prefix};
     matches!(
         path.components().next(),
-        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..))
+        // Anything but a drive.
+        Some(Component::Prefix(p)) if !matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
     )
 }
 
@@ -225,33 +263,47 @@ fn is_commit_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// How long git may take to answer. A project's settings can make git wait for ever (by
-/// pointing it at something that never answers): then the answer is "git can't say".
-const GIT_ANSWER_SECS: u64 = 30;
+/// How long git may go without answering. A project's settings can make git wait for ever
+/// (by pointing it at something that never answers): then the answer is "git can't say".
+fn git_answer_time() -> std::time::Duration {
+    // Tests can make it shorter, never longer.
+    let secs = std::env::var("ASQU_TEST_GIT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).map_or(30, |s| s.clamp(1, 30));
+    std::time::Duration::from_secs(secs)
+}
 
 /// Runs a git command to the end, or stops it when it takes too long.
 fn answer(mut cmd: Command) -> Result<std::process::Output> {
     let mut child = cmd.stdout(Stdio::piped()).spawn().context("git couldn't be run")?;
     let mut out = child.stdout.take().context("git couldn't be run")?;
     // Read from another thread, so a long answer never blocks git while we wait for it.
-    let reading = std::thread::spawn(move || {
+    let (send, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut data = Vec::new();
         let _ = out.read_to_end(&mut data);
-        data
+        let _ = send.send(data);
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GIT_ANSWER_SECS);
+    let stop = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let deadline = std::time::Instant::now() + git_answer_time();
     let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if std::time::Instant::now() > deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() > deadline => {
+                stop(&mut child);
                 bail!("git took too long to answer");
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Err(e) => {
+                stop(&mut child);
+                return Err(e).context("git couldn't be run");
+            }
         }
     };
-    let stdout = reading.join().unwrap_or_default();
+    // Git has ended, so its answer is complete, unless something it started still holds
+    // the answer open: don't wait on that.
+    let stdout = answered.recv_timeout(std::time::Duration::from_secs(5)).ok().context("git took too long to answer")?;
     Ok(std::process::Output { status, stdout, stderr: Vec::new() })
 }
 
@@ -395,6 +447,28 @@ pub fn read_commit(
         }
     });
     let mut reader = BufReader::new(child.stdout.take().context("git couldn't be run")?);
+    // Stopped if it goes too long without handing over a file (see `git_answer_time`).
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let (handed_over, finished) = (std::sync::Arc::new(AtomicU64::new(0)), std::sync::Arc::new(AtomicBool::new(false)));
+    let watching = {
+        let (child, handed_over, finished) = (child.clone(), handed_over.clone(), finished.clone());
+        std::thread::spawn(move || {
+            let (mut seen, mut since) = (0, std::time::Instant::now());
+            while !finished.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let now = handed_over.load(Ordering::Relaxed);
+                if now != seen {
+                    (seen, since) = (now, std::time::Instant::now());
+                } else if since.elapsed() > git_answer_time() {
+                    if let Ok(mut child) = child.lock() {
+                        let _ = child.kill(); // its answer ends, so the reading below fails
+                    }
+                    return;
+                }
+            }
+        })
+    };
     let result = (|| -> Result<()> {
         for (id, size, path, exec) in files {
             // "<id> blob <size>\n", the file's bytes, then "\n".
@@ -409,14 +483,19 @@ pub fn read_commit(
             let mut newline = [0u8; 1];
             reader.read_exact(&mut newline)?;
             each(BaseFile { path, exec, data })?;
+            handed_over.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     })();
     drop(reader);
-    if result.is_err() {
-        let _ = child.kill();
+    finished.store(true, Ordering::Relaxed);
+    let _ = watching.join();
+    if let Ok(mut child) = child.lock() {
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
     }
-    let _ = child.wait();
     let _ = asking.join();
     result
 }
@@ -498,6 +577,9 @@ mod tests {
             r"\\?\GLOBALROOT\x",
             r"\??\UNC\server\share",
             r"/.\x",
+            "//?/C:/x",
+            "/??/C:/x",
+            r"\.?\C:\x",
             "http://server/x",
             "",
         ] {
@@ -506,6 +588,28 @@ mod tests {
         for local in ["/home/me/project/.git/worktrees/a", "C:/Users/me/p/.git", r"C:\Users\me", "../..", r"\\?\C:\Users\me", r"\??\C:\x", "/", ".git/worktrees/a"] {
             assert!(!names_another_computer(local), "{local}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pointer_is_followed_step_by_step() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().canonicalize().unwrap();
+        fs::create_dir_all(base.join("a/b")).unwrap();
+        let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, base.join(at)).unwrap();
+        // A link that stays on this computer is followed; `..` after it starts from where it led.
+        link("a/b", "near");
+        assert_eq!(follow_locally(&base, "near"), Some(base.join("a/b")));
+        assert_eq!(follow_locally(&base, "near/.."), Some(base.join("a")));
+        // Links that lead round in a circle end, with no answer.
+        link("loop-b", "loop-a");
+        link("loop-a", "loop-b");
+        assert_eq!(follow_locally(&base, "loop-a/x"), None);
+        // A link whose target is written like another computer is never followed, even
+        // though on this system that would lead to a real folder.
+        link(&format!("/{}", base.join("a").display()), "far");
+        assert!(base.join("far/b").is_dir());
+        assert_eq!(follow_locally(&base, "far/b"), None);
     }
 
     #[test]

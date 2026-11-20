@@ -589,24 +589,149 @@ fn a_pointer_is_never_followed_through_a_link_to_another_computer() {
     let (t, home, main) = project();
     run(&main, &home, ASQU, &["save", "-w", "Start"]);
     let real = worktree(&main, &home, "real");
+    let main = main.canonicalize().unwrap();
     // A link on this computer on the way is fine: the worktree is reached through one.
     let through = t.path().join("shortcut");
     symlink(&real, &through).unwrap();
-    assert_eq!(asqu::worktree::main_of(&through), Some(main.canonicalize().unwrap()));
+    assert_eq!(asqu::worktree::main_of(&through), Some(main.clone()));
 
-    // A downloaded folder whose pointer goes through a link that names another computer:
-    // refused before anything is looked up there.
-    let fake = t.path().join("downloaded");
-    fs::create_dir_all(&fake).unwrap();
-    symlink("//elsewhere.invalid/share/entry", fake.join("hop")).unwrap();
-    fs::write(fake.join(".git"), "gitdir: hop\n").unwrap();
-    assert_eq!(asqu::worktree::main_of(&fake), None);
+    // A real worktree whose pointer goes through a link to git's real entry for it. With
+    // the link written as a place on this computer, it is followed...
+    let entry = main.join(".git/worktrees/real");
+    symlink(&entry, real.join("hop")).unwrap();
+    fs::write(real.join(".git"), "gitdir: hop\n").unwrap();
+    assert_eq!(asqu::worktree::main_of(&real), Some(main.clone()));
+    // ...and written the way another computer is (`//…`), it is not, although on this
+    // system it leads to the very same folder: only how it is written is looked at, so
+    // nothing is ever looked up there.
+    fs::remove_file(real.join("hop")).unwrap();
+    symlink(format!("/{}", entry.display()), real.join("hop")).unwrap();
+    assert!(real.join("hop/commondir").is_file());
+    assert_eq!(asqu::worktree::main_of(&real), None);
     // The same with the link in a folder beside it.
-    let beside = t.path().join("beside");
+    let beside = t.path().canonicalize().unwrap().join("beside");
     fs::create_dir_all(&beside).unwrap();
-    symlink("//elsewhere.invalid/share", beside.join("hop")).unwrap();
-    fs::write(fake.join(".git"), "gitdir: ../beside/hop/entry\n").unwrap();
-    assert_eq!(asqu::worktree::main_of(&fake), None);
+    symlink(main.join(".git/worktrees"), beside.join("near")).unwrap();
+    symlink(format!("/{}", main.join(".git/worktrees").display()), beside.join("far")).unwrap();
+    fs::write(real.join(".git"), format!("gitdir: {}/near/real\n", beside.display())).unwrap();
+    assert_eq!(asqu::worktree::main_of(&real), Some(main.clone()));
+    fs::write(real.join(".git"), format!("gitdir: {}/far/real\n", beside.display())).unwrap();
+    assert_eq!(asqu::worktree::main_of(&real), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_view_never_follows_a_pointer_that_isnt_confirmed() {
+    let (t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    // A real worktree is named after its main project.
+    let real = worktree(&main, &home, "real");
+    assert_eq!(asqu::projects::name(&real), "shop · real");
+    // A downloaded folder pointing at someone else's project is named as itself.
+    let fake = t.path().join("downloaded");
+    fs::create_dir_all(fake.join("gd")).unwrap();
+    fs::write(fake.join(".git"), "gitdir: gd\n").unwrap();
+    fs::write(fake.join("gd/commondir"), main.join(".git").display().to_string()).unwrap();
+    assert_eq!(asqu::projects::name(&fake), "downloaded");
+    // And one whose pointer is something that never answers doesn't hold the view up.
+    fs::remove_file(fake.join("gd/commondir")).unwrap();
+    assert!(Command::new("mkfifo").arg(fake.join("gd/commondir")).status().unwrap().success());
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || said.send(asqu::projects::name(&fake)));
+    assert_eq!(heard.recv_timeout(std::time::Duration::from_secs(5)).as_deref(), Ok("downloaded"));
+}
+
+#[cfg(unix)]
+#[test]
+fn git_that_never_answers_is_stopped_and_the_worktree_is_not_linked() {
+    let (_t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "stuck");
+    // The project's own settings point git at something that never answers.
+    let pipe = main.join(".git/never");
+    assert!(Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let mut config = fs::read_to_string(main.join(".git/config")).unwrap();
+    config.push_str(&format!("[include]\n\tpath = {}\n", pipe.display()));
+    fs::write(main.join(".git/config"), config).unwrap();
+    let started = std::time::Instant::now();
+    let o = Command::new(ASQU)
+        .arg("status")
+        .current_dir(&wt)
+        .env("ASQU_HOME", &home)
+        .env("ASQU_AUTO_BACKUP", "0")
+        .env("ASQU_AUTO_UPDATE", "0")
+        .env("ASQU_TEST_GIT_SECS", "1")
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(25), "{:?}", started.elapsed());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // Git couldn't say, so the worktree is a project of its own, not a Try.
+    let tries: i64 = db(&main).query_row("SELECT COUNT(*) FROM tries", [], |r| r.get(0)).unwrap();
+    assert_eq!(tries, 0);
+}
+
+#[test]
+fn a_try_is_found_by_its_folder_and_two_folders_of_one_name_are_told_apart() {
+    let (_t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    for (parent, branch) in [("a", "s1"), ("b", "s2")] {
+        let rel = format!(".claude/{parent}/same name");
+        run(&main, &home, "git", &["worktree", "add", "-q", &rel, "-b", branch]);
+        fs::write(main.join(&rel).join("new.txt"), branch).unwrap();
+        run(&main.join(&rel), &home, ASQU, &["save", "-w", "Edit"]);
+    }
+    let status = run(&main, &home, ASQU, &["status"]);
+    assert!(status.contains("2 open Tries") && status.contains("same-name-2"), "{status}");
+    // The folder's name fits both, so Asqu asks which.
+    let (ok, out) = attempt(&main, &home, &["try", "update", "same name", "--dry-run"]);
+    assert!(!ok && out.contains("more than one") && out.contains("same-name-2"), "{out}");
+    // A path, written from where you are, names one; so does the name in other capitals.
+    for asked in [".claude/b/same name", "./.claude/a/same name", "SAME-NAME"] {
+        let (ok, out) = attempt(&main, &home, &["try", "update", asked, "--dry-run"]);
+        assert!(ok, "{asked}: {out}");
+    }
+    // With one of the folders removed, the name means the one still there.
+    run(&main, &home, "git", &["worktree", "remove", "--force", ".claude/a/same name"]);
+    let (ok, out) = attempt(&main, &home, &["try", "update", "same name", "--dry-run"]);
+    assert!(ok && out.contains("same-name-2"), "{out}");
+}
+
+#[test]
+fn histories_from_early_builds_of_this_format_still_open() {
+    let (_t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "early");
+    fs::write(wt.join("new.txt"), "new\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
+    // An early build named the worktree by where git's entry for it was.
+    let id: String = db(&main).query_row("SELECT wt_id FROM tries", [], |r| r.get(0)).unwrap();
+    let old = format!("{}/{}", main.canonicalize().unwrap().join(".git/worktrees").display(), id);
+    db(&main).execute("UPDATE tries SET wt_id = ?1", [&old]).unwrap();
+    fs::write(wt.join("new.txt"), "newer\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "More"]);
+    let now: Vec<String> = {
+        let db = db(&main);
+        let mut q = db.prepare("SELECT name || ' ' || wt_id FROM tries").unwrap();
+        let rows = q.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        rows
+    };
+    assert_eq!(now, vec![format!("early {id}")], "still one Try, known the new way");
+    // An even earlier one had no such column at all.
+    db(&main).execute_batch("ALTER TABLE tries DROP COLUMN wt_id").unwrap();
+    assert!(run(&main, &home, ASQU, &["try", "list"]).contains("early"));
+}
+
+#[test]
+fn a_take_that_isnt_a_list_of_files_is_said_so() {
+    let (_t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "taken");
+    fs::write(wt.join("new.txt"), "new\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
+    for tool in ["asqu_try_update", "asqu_try_keep"] {
+        let (ok, out) = attempt(&main, &home, &["call", tool, r#"{"name":"taken","take":"try"}"#]);
+        assert!(!ok && out.contains("take") && out.contains("must be an object of file names"), "{tool}: {out}");
+    }
 }
 
 #[test]
@@ -646,6 +771,23 @@ fn line_endings_git_changes_never_cause_a_clash() {
     let kept = run(&main, &home, ASQU, &["try", "keep", "endings", "--no-check"]);
     assert!(kept.contains("Kept Try"), "{kept}");
     assert_eq!(text(&main.join("lines.txt")), "one (main)\ntwo\nthree\nfour\nfive (try)\n");
+}
+
+#[test]
+fn a_worktree_changing_a_files_line_endings_is_no_clash_with_an_untouched_file() {
+    let (_t, home, main) = project();
+    fs::write(main.join("lines.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    run(&main, &home, "git", &["add", "."]);
+    run(&main, &home, "git", &["commit", "-qm", "lines"]);
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "rewritten");
+    // The worktree rewrites the file with the other kind of line ending and edits a line,
+    // before Asqu has run there. The main project never touches the file.
+    fs::write(wt.join("lines.txt"), "one\r\ntwo\r\nthree\r\nfour\r\nfive (try)\r\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
+    let kept = run(&main, &home, ASQU, &["try", "keep", "rewritten", "--no-check"]);
+    assert!(kept.contains("Kept Try"), "{kept}");
+    assert_eq!(fs::read_to_string(main.join("lines.txt")).unwrap(), "one\r\ntwo\r\nthree\r\nfour\r\nfive (try)\r\n");
 }
 
 #[test]

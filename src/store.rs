@@ -443,6 +443,21 @@ impl Store {
             }
             tx.commit()?;
         }
+        // Early test builds of format 7 also named a worktree by where git's entry for it
+        // was (a path), not by the entry's name: put those in today's form.
+        let by_path: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare("SELECT name, wt_id FROM tries WHERE wt_id LIKE '%/%' OR wt_id LIKE '%\\%'")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        for (name, id) in by_path {
+            // "<entry>|<when>|<file>", and the entry may itself hold a `|`.
+            let mut parts = id.rsplitn(3, '|');
+            if let (Some(file), Some(when), Some(entry)) = (parts.next(), parts.next(), parts.next()) {
+                let entry = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
+                self.conn.execute("UPDATE tries SET wt_id = ?1 WHERE name = ?2 AND wt_id = ?3", params![format!("{entry}|{when}|{file}"), name, id])?;
+            }
+        }
         // Histories made by early test builds of format 6 lack this column.
         let has_checked: bool = self
             .conn
@@ -1426,16 +1441,6 @@ impl Store {
 /// worktree, including ones AI tools make (`.git` file pointing at the main project)?
 pub fn is_working_copy(dir: &Path) -> bool {
     fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir() || m.is_file())
-}
-
-/// For a git worktree, the main project's git folder. Only used to name the project in
-/// the view (never to write anything: the pointer could be faked).
-pub(crate) fn worktree_common_git_dir(root: &Path) -> Option<PathBuf> {
-    let pointer = fs::read_to_string(root.join(".git")).ok()?;
-    let gitdir = pointer.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
-    let gitdir = root.join(gitdir); // relative paths are relative to the worktree
-    let common = fs::read_to_string(gitdir.join("commondir")).ok()?;
-    gitdir.join(common.trim()).canonicalize().ok()
 }
 
 /// If the project is also a git repository, keeps `.asqu/` out of `git status` using git's
