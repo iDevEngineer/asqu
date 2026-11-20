@@ -222,12 +222,11 @@ impl Store {
             root.display()
         );
         if root.join(DIR).join("store.db").is_file() {
-            why.push_str(&format!(
+            why.push_str(
                 "\nAn earlier version of Asqu started a history here by mistake. It is no longer used, and nothing in it is \
-                 needed by your projects. To remove it, delete the files whose names start with `store` in {} (leave \
-                 everything else there: Asqu's own keys and settings may be in the same folder).",
-                root.join(DIR).display()
-            ));
+                 needed by your projects. To take it out, run `asqu remove` here: it is moved aside, not deleted, and \
+                 Asqu's own keys and settings stay.",
+            );
         }
         Some(why)
     }

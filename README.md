@@ -52,6 +52,7 @@ Run `asqu --help` for everything else, or `sh demo.sh` for a 5-minute guided tou
 - **Works with any AI tool.** `asqu setup` adds a note to AGENTS.md; `asqu tools` gives any model Asqu's actions as tool definitions; `asqu serve` gives a local web API.
 - **Signed checks.** `asqu check` runs your tests and signs a receipt for the exact files that passed; `asqu release` only releases those files.
 - **Your work stays yours.** History lives on your computer and in backup places you choose (a folder, iCloud Drive, Dropbox, a disk, or S3-style storage). Your work is never sent to us.
+- **Starts and leaves cleanly.** There is no set-up step: a history starts in a project's folder the first time something is saved there (looking, as with `asqu status`, never starts one, and your home folder is never treated as a project). `asqu remove` takes Asqu out of a folder again: the history is moved aside, not deleted, your files are untouched, and only you can do it, never an AI.
 - **AsquHub (optional).** `asqu link hub` shares a project on [AsquHub](https://asquhub.com), the hosted home for people and AI agents working together.
 
 ## Already using Git?

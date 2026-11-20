@@ -236,6 +236,17 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
 
 /// Like `call`, saying which folder the calling program is working in.
 pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str) -> Result<Value> {
+    // Looking never starts a history.
+    if Store::find_root(root).is_none() {
+        match name {
+            "asqu_status" => {
+                return Ok(json!({ "added": [], "modified": [], "deleted": [], "history": false,
+                    "note": "No history here yet, so nothing is recorded. The first asqu_save starts one." }))
+            }
+            "asqu_log" | "asqu_try_list" => return Ok(json!([])),
+            _ => {}
+        }
+    }
     let mut store = Store::open_or_create(root)?;
     let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
     let n = |k: &str| args.get(k).and_then(Value::as_i64);

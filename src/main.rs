@@ -252,6 +252,13 @@ enum Command {
         #[arg(long)]
         ai: Option<String>,
     },
+    /// Take Asqu out of this folder: its history here is moved aside (not deleted) and its
+    /// AI tool set-up is undone. Your own files are never touched. Only a person can do this
+    Remove {
+        /// Show what would be removed, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show Asqu's licence (Fair Source, FSL-1.1-ALv2)
     License,
     /// Update Asqu to the newest version (it also updates itself automatically, at most once a day)
@@ -428,6 +435,117 @@ fn ask(question: &str) -> Result<String> {
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     Ok(answer.trim().to_string())
+}
+
+/// `asqu remove`: takes Asqu out of the folder. Nothing is deleted: the history is moved
+/// to the person's own Asqu folder, from where it can be put back.
+fn remove_command(dry_run: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let root = match Store::find_root(&cwd) {
+        Some(root) => root.canonicalize()?,
+        // One started by mistake in a folder too wide to be a project (the home folder).
+        None if cwd.join(asqu::store::DIR).join("store.db").is_file() => cwd.clone(),
+        None => {
+            println!("Asqu keeps no history here, so there is nothing to remove.");
+            return Ok(());
+        }
+    };
+    // In a Try's own folder (a Git worktree): the history is the main project's.
+    if let Some(copy) = Store::files_root(&cwd).and_then(|c| c.canonicalize().ok()).filter(|c| *c != root) {
+        if asqu::worktree::main_of(&copy).is_some_and(|main| main == root) {
+            anyhow::bail!(
+                "This folder is a Try of {}. To drop the Try: `asqu try toss`. To take Asqu out of the whole project, \
+                 run `asqu remove` in {}.",
+                root.display(),
+                root.display()
+            );
+        }
+    }
+    let dir = root.join(asqu::store::DIR);
+    let home = asqu::sign::home().context("can't find your own Asqu folder to move the history to")?;
+    // In the home folder, the history shares its folder with Asqu's own keys and settings:
+    // only the history's files are moved.
+    let shared = home.canonicalize().ok() == dir.canonicalize().ok();
+    let count = |sql: &str| -> i64 {
+        rusqlite::Connection::open_with_flags(dir.join("store.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|c| c.query_row(sql, [], |r| r.get(0)))
+            .unwrap_or(0)
+    };
+    let (entries, tries) = (count("SELECT COUNT(*) FROM timeline"), count("SELECT COUNT(*) FROM tries WHERE status = 'open'"));
+    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+    let dest = home.join("removed").join(format!("{name}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+
+    println!("Asqu's history for {}:", root.display());
+    println!("  {entries} Timeline entr{}, {tries} open Tr{}.", if entries == 1 { "y" } else { "ies" }, if tries == 1 { "y" } else { "ies" });
+    println!("Removing it:");
+    println!("  - moves that history to {} (nothing is deleted)", dest.display());
+    println!("  - takes Asqu's notes and hooks for AI tools out of this folder");
+    println!("  - leaves your own files exactly as they are, and any backups where they are");
+    println!("After that, Asqu can undo nothing here. To bring the history back, move that folder back to {}.", dir.display());
+    if dry_run {
+        println!("Nothing was changed.");
+        return Ok(());
+    }
+    if !asqu::platform::person_confirms("Take Asqu out of this folder?")? {
+        println!("Not removed.");
+        return Ok(());
+    }
+
+    for (file, changed) in asqu::setup::remove(&root).unwrap_or_default() {
+        if changed {
+            println!("Removed Asqu's notes from {file}.");
+        }
+    }
+    for file in asqu::aitools::remove_all(&root).unwrap_or_default() {
+        println!("Removed Asqu's hooks from {}.", file.strip_prefix(&root).unwrap_or(&file).display());
+    }
+    // Fold everything into the one history file before it is moved.
+    if let Ok(conn) = rusqlite::Connection::open(dir.join("store.db")) {
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    }
+    if shared {
+        std::fs::create_dir_all(&dest)?;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if file.starts_with("store") || matches!(file.as_str(), "large" | "tries" | "backup-state.json" | "receipt.json") {
+                move_aside(&entry.path(), &dest.join(&file))?;
+            }
+        }
+    } else {
+        std::fs::create_dir_all(dest.parent().context("no folder to move the history to")?)?;
+        move_aside(&dir, &dest)?;
+    }
+    println!("Done. Asqu's history for this folder is now in {}.", dest.display());
+    Ok(())
+}
+
+/// Moves a file or folder, also to another disk (where it is copied, then the original
+/// removed). Links are never followed.
+fn move_aside(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    fn copy(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        let meta = std::fs::symlink_metadata(from)?;
+        if meta.is_dir() {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                copy(&entry.path(), &to.join(entry.file_name()))?;
+            }
+        } else if meta.is_file() {
+            std::fs::copy(from, to)?;
+        }
+        Ok(())
+    }
+    copy(from, to).with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+    if std::fs::symlink_metadata(from)?.is_dir() {
+        std::fs::remove_dir_all(from)?;
+    } else {
+        std::fs::remove_file(from)?;
+    }
+    Ok(())
 }
 
 fn setup_command(store: &mut Store, yes: bool, remove: bool, ai: Vec<String>, list: bool) -> Result<()> {
@@ -1239,6 +1357,11 @@ fn main() -> Result<()> {
             print!("{}", include_str!("../LICENSE"));
             return Ok(());
         }
+        Command::Remove { dry_run } => return remove_command(*dry_run),
+        Command::Tools { format } => {
+            println!("{}", serde_json::to_string_pretty(&asqu::tools::export(format)?)?);
+            return Ok(());
+        }
         Command::SignRelease { files } => return asqu::update::sign_release(files),
         Command::ReleaseKeygen { secret_file } => {
             println!("{}", asqu::update::new_release_key(secret_file)?);
@@ -1289,7 +1412,50 @@ fn main() -> Result<()> {
         asqu::update::maybe_start_auto_update();
     }
 
-    let mut store = Store::open_or_create(&std::env::current_dir()?)?;
+    // Looking never starts a history: one begins only when there is something to record.
+    let cwd = std::env::current_dir()?;
+    if Store::find_root(&cwd).is_none() {
+        let asks_for_change = matches!(
+            cli.command,
+            Command::Undo { .. } | Command::Back { .. } | Command::Mark { .. } | Command::Unlink { .. }
+        );
+        let only_looks = matches!(
+            cli.command,
+            Command::Status
+                | Command::Log { .. }
+                | Command::Show { .. }
+                | Command::Summary { .. }
+                | Command::Verify { .. }
+                | Command::Tidy { .. }
+                | Command::Backup { .. }
+                | Command::Link { place: None, .. }
+                | Command::Try { cmd: TryCmd::List }
+        );
+        // An AI tool that only looks gets its answer without a history being made.
+        if let Command::Call { tool, args } = &cli.command {
+            if matches!(tool.as_str(), "asqu_status" | "asqu_log" | "asqu_try_list") {
+                let _ = args;
+                let answer = asqu::tools::call(&cwd, tool, &serde_json::json!({}), &actor())?;
+                println!("{}", serde_json::to_string_pretty(&answer)?);
+                return Ok(());
+            }
+        }
+        if only_looks || asks_for_change {
+            let top = cwd.ancestors().find(|d| asqu::store::is_working_copy(d)).unwrap_or(&cwd);
+            if let Some(why) = Store::not_a_project(top) {
+                anyhow::bail!("{why}");
+            }
+            const NONE_YET: &str = "No history here yet. Asqu starts one by itself the first time something is saved \
+                                    here (`asqu save`, or an AI tool's first edit).";
+            if asks_for_change {
+                anyhow::bail!("{NONE_YET}");
+            }
+            println!("{NONE_YET}");
+            return Ok(());
+        }
+    }
+
+    let mut store = Store::open_or_create(&cwd)?;
     let project_root = store.root().to_path_buf();
 
     match cli.command {
@@ -1299,6 +1465,7 @@ fn main() -> Result<()> {
         | Command::SignRelease { .. }
         | Command::ReleaseKeygen { .. }
         | Command::Restore { .. }
+        | Command::Remove { .. }
         | Command::License => unreachable!(),
         Command::Link { place: Some(place), hub, project, agent, all, .. } if place == "hub" => {
             if all {
