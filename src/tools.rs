@@ -22,7 +22,7 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "asqu_status",
-            description: "List files changed since the last save in this project.",
+            description: "List files changed since the last save in this project. Called from inside a Try's folder (a Git worktree, say), it lists what differs from where that Try started, and names the Try.",
             parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
@@ -34,7 +34,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asqu_save",
-            description: "Save the current state of the project. Call when you've finished the person's request. Uses the request given to asqu_set_intent unless you pass a reason.",
+            description: "Save the current state of the project. Call when you've finished the person's request. Uses the request given to asqu_set_intent unless you pass a reason. Called from inside a Try's folder (a Git worktree, say), it saves that Try instead: \"saved_in_try\" names it and \"saved_as\" is null until the Try is kept.",
             parameters: json!({ "type": "object", "properties": {
                 "why": { "type": "string", "description": "The request or reason behind the change, in plain words." }
             }}),
@@ -48,7 +48,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asqu_undo",
-            description: "Undo the last change(s) to the project. Nothing is lost: the undo can itself be undone.",
+            description: "Undo the last change(s) to the project. Nothing is lost: the undo can itself be undone. Refused inside a Try's folder, because it changes the main project: the error says where to run it.",
             parameters: json!({ "type": "object", "properties": {
                 "steps": { "type": "integer", "description": "How many changes to go back (default 1)." },
                 "dry_run": dry_run.clone()
@@ -85,7 +85,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asqu_try_start",
-            description: "Start a Try: a separate copy of the project to attempt a change safely. Returns the folder to work in. Not needed inside a git worktree: Asqu already records a worktree as a Try of the main project (see asqu_try_list). Several Tries can run at once (e.g. one per AI for the same request; compare them with asqu_try_compare).",
+            description: "Start a Try: a separate copy of the project to attempt a change safely. Returns the folder to work in. Not needed inside a Git worktree: Asqu already records a worktree as a Try of the main project (asqu_try_list shows it with \"worktree\": true). Several Tries can run at once (e.g. one per AI for the same request; compare them with asqu_try_compare).",
             parameters: json!({ "type": "object", "properties": {
                 "name": { "type": "string", "description": "Short name, e.g. \"blue-header\" (letters, numbers, - and _, up to 40; not \"main\")." },
                 "why": { "type": "string", "description": "What this Try is for." }
@@ -93,7 +93,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asqu_try_list",
-            description: "List Tries with their status and how many files each changed.",
+            description: "List Tries with their status and how many files each changed. \"worktree\": true marks a Git worktree linked as a Try (its folder is never removed by Asqu); \"folder_gone\": true means that folder was removed and the Try stands as last saved.",
             parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
@@ -112,16 +112,6 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: json!({ "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] }),
         },
         ToolDef {
-            name: "asqu_try_update",
-            description: "Bring a Try up to date: combines what changed in the main project since the Try started into the Try's folder. The main project is not changed. If both sides changed the same lines, nothing is changed and the result lists \"questions\" per file: ask the person which version to keep, then call again with \"take\". Use dry_run to see what would change first.",
-            parameters: json!({ "type": "object", "properties": {
-                "name": { "type": "string" },
-                "dry_run": { "type": "boolean", "description": "Show what would change, without changing anything." },
-                "take": { "type": "object", "additionalProperties": { "type": "string", "enum": ["try", "main"] },
-                    "description": "After a clash: which version to keep per file, e.g. {\"app.js\": \"try\"}." }
-            }, "required": ["name"] }),
-        },
-        ToolDef {
             name: "asqu_try_reopen",
             description: "Bring back a tossed Try, with its folder as it was last saved. Works for 7 days after it was tossed.",
             parameters: json!({ "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] }),
@@ -133,6 +123,16 @@ pub fn definitions() -> Vec<ToolDef> {
                 "names": { "type": "array", "items": { "type": "string" }, "description": "Which Tries (default: all open ones)." },
                 "run_checks": { "type": "boolean", "description": "Run the check in each Try (default true)." }
             }}),
+        },
+        ToolDef {
+            name: "asqu_try_update",
+            description: "Bring a Try up to date: combines what changed in the main project since the Try started into the Try's folder. The main project's files are not changed (unsaved work on both sides is saved first). \"status\" is \"updated\", \"would_update\" (dry_run), \"up_to_date\" or \"clash\". On a clash nothing is changed and \"questions\" lists what each side has per file: ask the person which version to keep, then call again with \"take\".",
+            parameters: json!({ "type": "object", "properties": {
+                "name": { "type": "string", "description": "The Try's name, as listed by asqu_try_list." },
+                "dry_run": { "type": "boolean", "description": "Show what would change in the Try's folder, without changing any files." },
+                "take": { "type": "object", "additionalProperties": { "type": "string", "enum": ["try", "main"] },
+                    "description": "After a clash: which version to keep per file, e.g. {\"app.js\": \"try\"}." }
+            }, "required": ["name"] }),
         },
     ]
 }
@@ -220,17 +220,38 @@ pub fn go_back(store: &mut Store, seq: i64, dry_run: bool, who: Why) -> Result<V
     }))
 }
 
+/// The folder the calling program is working in, when that isn't the project's own (set
+/// once, by `asqu call`). A tool call made from inside a Try's folder belongs to that Try.
+static CALLER_FOLDER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Says where the calling program is working (see `CALLER_FOLDER`).
+pub fn set_caller_folder(dir: &Path) {
+    let _ = CALLER_FOLDER.set(dir.to_path_buf());
+}
+
 /// Runs one tool call. `args` is the JSON object the model produced.
 pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value> {
+    call_from(root, CALLER_FOLDER.get().map(|p| p.as_path()).unwrap_or(root), name, args, actor)
+}
+
+/// Like `call`, saying which folder the calling program is working in.
+pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str) -> Result<Value> {
     let mut store = Store::open_or_create(root)?;
     let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
     let n = |k: &str| args.get(k).and_then(Value::as_i64);
     let dry = args.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
     // Called from inside a Try's folder (a git worktree linked as a Try, say): saving and
     // requests belong to that Try, and nothing here changes the main project by surprise.
-    let here = store.try_for_path(root);
+    let here = store.try_for_path(from);
 
     match name {
+        "asqu_status" if here.is_some() => {
+            let name = here.unwrap_or_default();
+            let mut v = changes_json(&store.try_changes(&name)?);
+            v["try"] = json!(name);
+            v["next"] = json!(format!("This folder is Try \"{name}\": these files differ from where it started. Keep them with asqu_try_keep; bring in the main project's changes with asqu_try_update."));
+            Ok(v)
+        }
         "asqu_status" => Ok(changes_json(&store.status()?)),
         "asqu_log" => {
             let marks = store.marks()?;
@@ -251,8 +272,10 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
             let name = here.unwrap_or_default();
             let why = Why { request: s("why").unwrap_or_default(), ..caller(actor) };
             let c = store.save_try(&name, &why)?;
-            Ok(json!({ "saved_in_try": name, "files_changed": c.count(),
-                "next": format!("This folder is Try \"{name}\". When it's good, call asqu_try_keep.") }))
+            let what = if c.is_empty() { None } else { Some(crate::describe::summarize(&c, None)) };
+            // `saved_as` is a Timeline entry number: a save inside a Try makes none until it is kept.
+            Ok(json!({ "saved_as": null, "what": what, "saved_in_try": name, "files_changed": c.count(),
+                "next": format!("This folder is Try \"{name}\", so this was saved in the Try, not the main project. When it's good, call asqu_try_keep.") }))
         }
         "asqu_set_intent" if here.is_some() => {
             store.set_try_intent(&here.unwrap_or_default(), &s("request").unwrap_or_default())?;
@@ -322,7 +345,8 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
                 .into_iter()
                 .map(|t| json!({ "name": t.name, "status": t.status, "from": t.base_seq,
                     "files_changed": t.changed, "why": t.request, "folder": t.path.display().to_string(),
-                    "worktree": t.worktree, "folder_gone": t.folder_gone }))
+                    "worktree": t.worktree, "folder_gone": t.folder_gone,
+                    "reopened_by": store.reopened_by(&t.name) }))
                 .collect(),
         )),
         "asqu_try_keep" => {
@@ -358,13 +382,13 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
             use crate::tries::UpdateOutcome;
             let name = s("name").context("\"name\" is required")?;
             Ok(match store.update_try(&name, &take_arg(args)?, dry, actor)? {
-                UpdateOutcome::UpToDate => json!({ "status": "up_to_date", "name": name }),
-                UpdateOutcome::Updated { changes, dry_run } => {
-                    let mut v = changes_json(&changes);
-                    v["status"] = json!(if dry_run { "would_update" } else { "updated" });
-                    v["name"] = json!(name);
-                    v
-                }
+                UpdateOutcome::UpToDate => json!({ "status": "up_to_date", "name": name,
+                    "next": "Nothing to do: the Try already has everything in the main project." }),
+                UpdateOutcome::Updated { changes, dry_run } => json!({
+                    "status": if dry_run { "would_update" } else { "updated" }, "name": name,
+                    "changes": changes_json(&changes),
+                    "next": if dry_run { "No files were changed. Call again without dry_run to do it." }
+                        else { "The Try's folder now holds the main project's changes too. Carry on there, then call asqu_try_keep." } }),
                 UpdateOutcome::Clash { files, questions } => json!({ "status": "clash", "files": files,
                     "questions": questions.iter().map(|q| json!({ "file": q.path, "what": q.what,
                         "parts": q.parts.iter().map(|p| json!({ "line": p.line, "main": p.main, "try": p.try_text })).collect::<Vec<_>>() })).collect::<Vec<_>>(),
@@ -377,10 +401,17 @@ pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value>
 
 fn keep_json(store: &mut Store, name: &str, opts: crate::tries::KeepOptions, actor: &str) -> Result<Value> {
     use crate::tries::KeepOutcome;
+    let gone = store.list_tries()?.iter().any(|t| t.name == name && t.status == "open" && t.folder_gone);
     Ok(match store.keep_try(name, opts, actor)? {
-        KeepOutcome::Kept { seq, risk, changes, check, .. } => json!({ "kept": true, "saved_as": seq,
-            "risk": risk.level.word(), "changes": changes_json(&changes),
-            "check": check.map(|c| c.command) }),
+        KeepOutcome::Kept { seq, risk, changes, check, .. } => {
+            let mut v = json!({ "kept": true, "saved_as": seq,
+                "risk": risk.level.word(), "changes": changes_json(&changes),
+                "check": check.map(|c| c.command) });
+            if gone {
+                v["note"] = json!("The Try's worktree folder was gone, so it was kept as it was last saved.");
+            }
+            v
+        }
         KeepOutcome::Clash { files, questions } => json!({ "kept": false, "reason": "clash", "files": files,
             "questions": questions.iter().map(|q| json!({ "file": q.path, "what": q.what,
                 "parts": q.parts.iter().map(|p| json!({ "line": p.line, "main": p.main, "try": p.try_text })).collect::<Vec<_>>() }))

@@ -9,8 +9,11 @@
 //! - **A worktree is confirmed from both sides.** Its `.git` file names a folder inside the
 //!   main project's own `.git`, and that folder names the worktree back. A downloaded
 //!   folder can fake its own `.git` file, but can't write inside another project's `.git`.
-//! - **Git is only read.** Only commands that read stored commits are run (never ones that
-//!   look at the working files, which can run a project's own filters or hooks).
+//! - **Git is only read.** Only commands that read what git has stored are run (never ones
+//!   that write, or that run a project's own filters or hooks), and git is told never to
+//!   fetch anything: a project that fetches missing files on demand names, in its own
+//!   settings, the command to fetch them with, which a downloaded project could set to
+//!   anything. Such a project's worktrees are never linked.
 
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -62,10 +65,21 @@ pub fn main_of(top: &Path) -> Option<PathBuf> {
 }
 
 /// A git command that only reads: no prompts, no pager, none of the settings that point
-/// git at another project, and no background work.
+/// git at another project, no background work, and no fetching of any kind (so nothing a
+/// project's own git settings name as "how to fetch" is ever run).
 fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
-    c.arg("-C").arg(plain(dir)).args(["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false"]);
+    c.arg("-C").arg(plain(dir)).args([
+        "--no-pager",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.allow=never",
+    ]);
+    // Never fetch a missing file on demand (git 2.45 and later; older ones are covered by
+    // `fetches_on_demand` and by allowing no way of fetching at all).
+    c.env("GIT_NO_LAZY_FETCH", "1").env("GIT_ALLOW_PROTOCOL", "none");
     for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE", "GIT_PREFIX"] {
         c.env_remove(var);
     }
@@ -95,10 +109,45 @@ fn one_id(mut cmd: Command) -> Result<String> {
     Ok(id)
 }
 
+/// Is this a project that fetches missing files on demand (a "partial clone")? Reading its
+/// history could make git run the fetch command its settings name, so it is never read.
+/// Only reads git's settings. When git can't say, the answer is yes.
+fn fetches_on_demand(dir: &Path) -> bool {
+    let mut c = git(dir);
+    c.args(["config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$"]);
+    match c.output() {
+        // Exit 1 with nothing printed: no such setting.
+        Ok(out) => !(out.status.code() == Some(1) && out.stdout.iter().all(|b| b.is_ascii_whitespace())),
+        Err(_) => true,
+    }
+}
+
+/// Does the worktree hold only part of the project (a "sparse" or empty checkout)? Files
+/// git left out on purpose would look removed, so such a worktree is never a Try.
+/// Only reads git's list of files. When git can't say, the answer is yes.
+pub fn partly_checked_out(top: &Path) -> bool {
+    let mut c = git(top);
+    // Each entry: "<mark> <path>", ended by a zero byte. The mark S: left out on purpose.
+    c.args(["ls-files", "-t", "-z"]);
+    match c.output() {
+        Ok(out) if out.status.success() => {
+            out.stdout.is_empty() || out.stdout.split(|b| *b == 0).any(|e| e.starts_with(b"S ") || e.starts_with(b"s "))
+        }
+        _ => true,
+    }
+}
+
 /// The commit where the worktree's work and the main project's last parted: the worktree's
 /// starting point. Fails (and so the worktree stays a separate project) when git is
-/// missing, either folder has no commit yet, or the two share no history.
+/// missing, either folder has no commit yet, the two share no history, the project
+/// fetches files on demand, or the worktree holds only part of the project.
 pub fn base_commit(top: &Path, main: &Path) -> Result<String> {
+    if fetches_on_demand(main) || fetches_on_demand(top) {
+        bail!("this project fetches its files on demand");
+    }
+    if partly_checked_out(top) {
+        bail!("this worktree holds only part of the project");
+    }
     let head = |dir: &Path| {
         let mut c = git(dir);
         c.args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);

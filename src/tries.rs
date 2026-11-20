@@ -136,6 +136,9 @@ pub struct KeepOptions {
     pub trust_check: bool,
 }
 
+/// A Try's row as stored: starting entry, status, request, files, folder, starting point.
+type StoredRow = (i64, String, String, Vec<u8>, Option<String>, Option<Vec<u8>>);
+
 pub(crate) struct Row {
     pub base_seq: i64,
     pub status: String,
@@ -244,7 +247,7 @@ impl Store {
                 },
             )
             .optional()?
-            .map(|(base_seq, status, request, m, path, base): (i64, String, String, Vec<u8>, Option<String>, Option<Vec<u8>>)| {
+            .map(|(base_seq, status, request, m, path, base): StoredRow| {
                 Ok::<_, anyhow::Error>(Row {
                     base_seq,
                     status,
@@ -293,10 +296,21 @@ impl Store {
                 // Git may store one kind of line ending and write the other into the folder.
                 // A file that only differs that way hasn't changed: start from the folder's.
                 let here = top.join(&f.path);
+                let mut matched = false;
                 if fs::symlink_metadata(&here).is_ok_and(|m| m.is_file()) {
                     if let Ok(cur) = fs::read(&here) {
                         if cur != f.data && crate::worktree::same_but_line_endings(&cur, &f.data) {
                             f.data = cur;
+                            matched = true;
+                        }
+                    }
+                }
+                // Already edited in the worktree: the main project's own copy shows which
+                // line endings git writes here.
+                if !matched {
+                    if let Some(main) = head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()) {
+                        if main != f.data && crate::worktree::same_but_line_endings(&main, &f.data) {
+                            f.data = main;
                         }
                     }
                 }
@@ -340,7 +354,8 @@ impl Store {
     }
 
     /// The person's current request, said inside a Try's folder: the Try's next saves are
-    /// labelled with it, and a linked worktree's Try is named after the first one.
+    /// labelled with it (until the Try is kept or the request is cleared), and it becomes
+    /// what a linked worktree's Try is for, if nothing was said before.
     pub fn set_try_intent(&self, name: &str, request: &str) -> Result<()> {
         let request = request.trim();
         if request.is_empty() {
@@ -355,11 +370,55 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets the request set with `set_try_intent`.
+    pub fn clear_try_intent(&self, name: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM meta WHERE key = ?1", [format!("try_intent:{name}")])?;
+        Ok(())
+    }
+
+    /// Who reopened a Try the person had tossed, by working on in its folder (if that is
+    /// how it came back).
+    pub fn reopened_by(&self, name: &str) -> Option<String> {
+        self.meta(&format!("try_reopened:{name}")).ok().flatten()
+    }
+
+    /// A worktree that holds only part of the project (git left files out on purpose, or
+    /// has written none yet): those files would read as removed, so it is never combined.
+    fn refuse_partly_checked_out(&self, name: &str, row: &Row) -> Result<()> {
+        if let Some(path) = row.path.as_ref().filter(|_| self.folder_ok(row)) {
+            if crate::worktree::partly_checked_out(path) {
+                bail!(
+                    "Try \"{name}\" is a Git worktree that holds only part of the project (a sparse checkout), \
+                     so Asqu can't tell files that were removed from files that were never there. \
+                     Check out the whole project in {} and try again.",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The files in a Try's folder that differ from where it started, saved or not.
+    pub fn try_changes(&self, name: &str) -> Result<Changes> {
+        let row = self.try_row(name)?;
+        let dir = self.try_dir(name);
+        let now = if self.folder_ok(&row) && dir.is_dir() {
+            self.snapshot_dir(&self.conn, &dir, false)?
+        } else {
+            self.manifest_from_hash(&row.manifest)?
+        };
+        Ok(Store::diff(&self.base_of(&row)?, &now))
+    }
+
     /// Why commands that change the main project are refused inside a Try's folder.
     pub fn main_only_note(&self, name: &str) -> String {
+        let drop = if matches!(self.try_row(name), Ok(Row { path: Some(_), .. })) {
+            format!("To set this Try's work aside: `asqu try toss {name}` (the files in this folder stay as they are).")
+        } else {
+            format!("To drop this Try's work instead: `asqu try toss {name}`.")
+        };
         format!(
-            "You're in the folder of Try \"{name}\". Undo and going back change the main project, so run them there: {}\n\
-             To drop this Try's work instead: `asqu try toss {name}`.",
+            "You're in the folder of Try \"{name}\". Undo and going back change the main project, so run them from its folder: {}\n{drop}",
             self.root().display()
         )
     }
@@ -454,10 +513,7 @@ impl Store {
         let found = self.try_row(name)?;
         if found.path.is_some() {
             if !self.folder_ok(&found) {
-                if found.status == "open" {
-                    return Ok(Changes::default());
-                }
-                bail!("Try \"{name}\" was already {}", found.status);
+                return Ok(Changes::default());
             }
             if found.status != "open" {
                 // Only the person brings back a Try that came from a backup.
@@ -467,12 +523,16 @@ impl Store {
                 let dir = self.try_dir(name);
                 let now = self.snapshot_dir(&self.conn, &dir, false)?;
                 if Store::diff(&self.manifest_from_hash(&found.manifest)?, &now).is_empty() {
-                    bail!("Try \"{name}\" was already {}", found.status);
+                    return Ok(Changes::default()); // nothing new there since it was closed
                 }
                 self.conn.execute(
                     "UPDATE tries SET status = 'open', closed = NULL, kept_seq = NULL WHERE name = ?1",
                     [name],
                 )?;
+                if found.status == "tossed" {
+                    // The person tossed it: say plainly that it is back, and why.
+                    self.set_meta(&format!("try_reopened:{name}"), &why.actor)?;
+                }
             }
         }
         let row = self.open_try(name)?;
@@ -533,7 +593,8 @@ impl Store {
                 // Open Tries: count what's in the folder right now, saved or not.
                 let dir = self.try_dir(&name);
                 let there = self.folder_ok(&row);
-                let now = if row.status == "open" && there && dir.is_dir() {
+                let live = row.status == "open" || (row.path.is_some() && !self.try_is_set_aside(&name)?);
+                let now = if live && there && dir.is_dir() {
                     self.snapshot_dir(&self.conn, &dir, false)?
                 } else {
                     self.manifest_from_hash(&row.manifest)?
@@ -635,6 +696,7 @@ impl Store {
         let row = Row { manifest: self.try_row(name)?.manifest, ..row };
         // A worktree whose folder is gone: kept from its last saved state.
         let folder_there = self.folder_ok(&row);
+        self.refuse_partly_checked_out(name, &row)?;
 
         let base = self.base_of(&row)?;
         let ours = self.current_manifest()?;
@@ -658,6 +720,10 @@ impl Store {
         // What exactly would be kept, and the check that would run: an approval given for
         // anything else doesn't count.
         let mut seen = Store::encode_manifest(&merged);
+        // And what it would replace: if the main project has changed since the person was
+        // shown the result, they are asked again.
+        seen.extend_from_slice(b"\0over:");
+        seen.extend_from_slice(&Store::encode_manifest(&ours));
         seen.extend_from_slice(b"\0check:");
         let check_cmd = cfg.check_command(cfg.clean);
         seen.extend_from_slice(check_cmd.as_deref().unwrap_or("").as_bytes());
@@ -671,7 +737,7 @@ impl Store {
         let risk = crate::decide::review_risk(risk::assess(&changes, lines, &cfg), &changes, &row.request);
         if changes.is_empty() {
             if Store::diff(&base, &theirs).is_empty() {
-                self.mark_kept(name, None)?; // it never changed anything
+                self.mark_kept(name, None, &theirs)?; // it never changed anything
             } else {
                 // Its changes were all set aside (the person chose the main project's version):
                 // closed as tossed, so it can still be brought back for a while.
@@ -689,6 +755,9 @@ impl Store {
 
         let mut check = None;
         let mut checked = None;
+        // What Asqu knows the Try's folder holds: its saved files, or the combined result
+        // once that has been written there for the check.
+        let mut in_folder = &theirs;
         if let (Some(cmd), false) = (&check_cmd, opts.skip_check) {
             if !crate::trust::check_is_trusted(self.root(), cmd) {
                 if cmd.chars().any(describe::is_hidden) {
@@ -711,6 +780,7 @@ impl Store {
             let dir = self.try_dir(name);
             if folder_there {
                 self.apply(&dir, &Store::diff(&theirs, &merged), &merged)?;
+                in_folder = &merged;
             }
             let (result, files) = if cfg.clean || !folder_there {
                 let (result, files) = self.run_check_clean(&merged, cmd)?;
@@ -736,7 +806,7 @@ impl Store {
             ..Default::default()
         })?;
         let seq = saved.map(|r| r.seq);
-        self.mark_kept(name, seq)?;
+        self.mark_kept(name, seq, in_folder)?;
         // The check passed on exactly these files: sign a receipt saying so.
         let receipt = match (&check_cmd, checked) {
             (Some(cmd), Some(files)) => crate::receipt::issue(&root, files, cmd, cfg.clean || !folder_there).ok(),
@@ -745,25 +815,26 @@ impl Store {
         Ok(KeepOutcome::Kept { seq, risk, changes, check, receipt })
     }
 
-    fn mark_kept(&mut self, name: &str, seq: Option<i64>) -> Result<()> {
+    /// `in_folder`: the files Asqu last saw or wrote in the Try's folder, all of them now
+    /// kept. Never a fresh look at the folder: anything written there while the keep was
+    /// going on (by a slow check, or an AI still working) hasn't been kept, and must still
+    /// show as new work.
+    fn mark_kept(&mut self, name: &str, seq: Option<i64>, in_folder: &Manifest) -> Result<()> {
         let row = self.try_row(name)?;
+        let _ = self.conn.execute("DELETE FROM meta WHERE key IN (?1, ?2)", params![format!("try_intent:{name}"), format!("try_reopened:{name}")]);
         self.conn
             .execute(
                 "UPDATE tries SET status = 'kept', kept_seq = ?1, closed = ?2 WHERE name = ?3",
                 params![seq, chrono::Utc::now().timestamp(), name],
             )?;
         if row.path.is_some() {
-            // The worktree stays. Whatever is in it now has been kept, so that is where any
-            // further work there starts from (the Try opens again when the folder changes).
-            if self.folder_ok(&row) {
-                let dir = self.try_dir(name);
-                let now = self.snapshot_dir(&self.conn, &dir, true)?;
-                let mh = self.put_blob_near(&self.conn, &Store::encode_manifest(&now), Some(&row.manifest))?;
-                self.conn.execute(
-                    "UPDATE tries SET manifest = ?1, base = ?1, base_seq = COALESCE(?2, base_seq) WHERE name = ?3",
-                    params![&mh[..], self.head_seq()?, name],
-                )?;
-            }
+            // The worktree stays. What was kept is where any further work there starts
+            // from (the Try opens again when the folder holds something else).
+            let mh = self.put_blob_near(&self.conn, &Store::encode_manifest(in_folder), Some(&row.manifest))?;
+            self.conn.execute(
+                "UPDATE tries SET manifest = ?1, base = ?1, base_seq = COALESCE(?2, base_seq) WHERE name = ?3",
+                params![&mh[..], self.head_seq()?, name],
+            )?;
         } else {
             self.remove_own_folder(name);
         }
@@ -793,6 +864,7 @@ impl Store {
                 self.try_dir(name).display()
             );
         }
+        self.refuse_partly_checked_out(name, &row)?;
         self.save_try(name, &who)?;
         self.save(&who)?; // the main project exactly as it is now
         let row = self.try_row(name)?;

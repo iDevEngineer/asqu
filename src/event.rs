@@ -172,7 +172,13 @@ pub fn handle(kind: Option<Kind>, ai: Option<&str>, input: &str, actor: &str) ->
             let mut store = Store::open_or_create(&cwd)?;
             let why = why(&store)?;
             // An edit inside a Try's folder belongs to that Try, not the main project.
-            if let Some(name) = find_path(&v).and_then(|p| store.try_for_path(&p)).or_else(|| store.try_for_path(&cwd)) {
+            // The edited file says which it is; only when the tool names none, the folder the
+            // tool is working in does.
+            let in_try = match find_path(&v) {
+                Some(p) => store.try_for_path(&p),
+                None => store.try_for_path(&cwd),
+            };
+            if let Some(name) = in_try {
                 store.save_try(&name, &why)?;
             } else {
                 store.save(&why)?;
@@ -183,6 +189,7 @@ pub fn handle(kind: Option<Kind>, ai: Option<&str>, input: &str, actor: &str) ->
             let why = why(&store)?;
             if let Some(name) = store.try_for_path(&cwd) {
                 store.save_try(&name, &why)?; // work done in a Try's folder belongs to that Try
+                store.clear_try_intent(&name)?; // the task is finished
             } else {
                 store.save(&why)?;
                 store.clear_intent(); // the task is finished

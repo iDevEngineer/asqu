@@ -6,6 +6,7 @@
 //! | 30 days | saves made inside a Try that was later kept (its result is in the Timeline) |
 //! | 7 days  | tossed Tries (`asqu try reopen` brings one back until then) |
 //! | 7 days  | the full copy of the history kept before the upgrade to the smaller format (`store-v5.db`), for going back to Asqu 0.2 |
+//! | 7 days  | the full copy kept before the upgrade to format 7, worktree Tries (`store-v6.db`), for going back to Asqu 0.1.0. It holds nothing saved after the upgrade |
 //!
 //! Stored file versions nothing points to any more are removed, but never one stored or
 //! used again in the last hour, so a save in progress can't lose anything. While the copy
@@ -202,7 +203,7 @@ impl Store {
     }
 
     /// Every stored version something still points to: each Timeline entry's and Try's
-    /// list of files and everything in them, the files of remaining edits, and the
+    /// list of files (and each Try's stored starting point) and everything in them, the files of remaining edits, and the
     /// versions any of those are stored as a difference from.
     fn needed_versions(&self) -> Result<HashSet<Hash>> {
         let column = |sql: &str| -> Result<Vec<Hash>> {
@@ -212,7 +213,12 @@ impl Store {
         };
         let mut keep: HashSet<Hash> = HashSet::new();
         let manifests: HashSet<Hash> =
-            column("SELECT manifest FROM timeline UNION SELECT manifest FROM tries")?.into_iter().collect();
+            column(
+                "SELECT manifest FROM timeline UNION SELECT manifest FROM tries
+                 UNION SELECT base FROM tries WHERE base IS NOT NULL",
+            )?
+            .into_iter()
+            .collect();
         for m in &manifests {
             for f in self.manifest_from_hash(m)?.values() {
                 keep.insert(f.hash);

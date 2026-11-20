@@ -157,6 +157,16 @@ impl Store {
         None
     }
 
+    /// The folder whose own files `start` belongs to: the nearest one at or above it with a
+    /// store of its own, or the top of its working copy. Unlike `find_root`, a worktree is
+    /// never swapped for its main project: use this when the files themselves matter.
+    pub fn files_root(start: &Path) -> Option<PathBuf> {
+        start
+            .ancestors()
+            .find(|dir| dir.join(DIR).join("store.db").is_file() || is_working_copy(dir))
+            .map(Path::to_path_buf)
+    }
+
     /// Opens the store for `start`, creating one silently if none exists: at the top of the
     /// working copy `start` is in (a git project or worktree), or in `start` itself.
     ///
@@ -403,8 +413,18 @@ impl Store {
                     PRAGMA user_version = 7;
                     ",
                 )?;
+                tx.commit()?;
+                if version == 6 {
+                    // Said once, when it happens: the only moment the way back is news.
+                    eprintln!(
+                        "asqu: this project's history was updated for this version of Asqu. A copy for the older \
+                         version is kept for 7 days at {} (it holds nothing saved from now on).",
+                        self.root.join(DIR).join(ROLLBACK_COPY_V6).display()
+                    );
+                }
+            } else {
+                tx.commit()?;
             }
-            tx.commit()?;
         }
         // Histories made by early test builds of format 6 lack this column.
         let has_checked: bool = self
@@ -1359,6 +1379,26 @@ impl Store {
             // Read back exactly as a restore would (undoing compression and differences).
             if !self.get_blob(&h).is_ok_and(|data| hash::of(&data) == h) {
                 problems.push(format!("stored content {} is damaged", hash::short(&h)));
+            }
+        }
+        // Open Tries: the files each holds, and where it started, must still be stored.
+        {
+            let mut stmt = self.conn.prepare("SELECT name, manifest, base FROM tries WHERE status = 'open' ORDER BY name")?;
+            let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>)> =
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (name, manifest, base) in rows {
+                for (what, stored) in [("files", Some(manifest)), ("starting point", base)] {
+                    let Some(h) = stored.as_deref().and_then(hash::from_slice) else { continue };
+                    let missing = match self.manifest_from_hash(&h) {
+                        Err(_) => true,
+                        Ok(m) => m.values().any(|f| {
+                            !self.conn.query_row("SELECT 1 FROM blobs WHERE hash = ?1", [&f.hash[..]], |_| Ok(())).optional().is_ok_and(|r| r.is_some())
+                        }),
+                    };
+                    if missing {
+                        problems.push(format!("Try \"{}\": some of its {what} are missing from the history", describe::printable(&name)));
+                    }
+                }
             }
         }
         Ok(problems)
