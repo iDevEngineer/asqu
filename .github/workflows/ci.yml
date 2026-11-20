@@ -51,7 +51,13 @@ jobs:
           $h = (Get-FileHash "$d\$asset" -Algorithm SHA256).Hash.ToLower()
           Set-Content "$d\$asset.sha256" "$h  $asset"
           $server = Start-Process python -ArgumentList '-m', 'http.server', '8765', '--directory', $d -PassThru -WindowStyle Hidden
-          Start-Sleep -Seconds 3
+          # Wait until the local server answers (it can take longer than a fixed pause).
+          $up = $false
+          foreach ($i in 1..30) {
+            try { Invoke-WebRequest 'http://127.0.0.1:8765/' -UseBasicParsing | Out-Null; $up = $true; break }
+            catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $up) { Write-Host 'The local download server did not start'; exit 1 }
           $env:ASQU_DOWNLOAD_BASE = 'http://127.0.0.1:8765'
           $env:ASQU_INSTALL_DIR = "$env:RUNNER_TEMP\bin"
           Get-Content install.ps1 -Raw | Invoke-Expression

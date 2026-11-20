@@ -187,3 +187,192 @@ fn several_tries_are_started_and_compared_from_the_terminal() {
     let (ok, out) = asqu(root, &["tidy", "--dry-run"]);
     assert!(ok && out.contains("Every Timeline entry is kept"), "{out}");
 }
+
+/// Runs `asqu` as someone whose home folder is `home`.
+fn asqu_at_home(dir: &Path, home: &Path, args: &[&str], input: Option<&str>) -> (bool, String) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_asqu"))
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("ASQU_HOME", home.join(".asqu-settings"))
+        .env("ASQU_AUTO_UPDATE", "0")
+        .env("ASQU_AUTO_BACKUP", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.unwrap_or("").as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+}
+
+#[test]
+fn the_home_folder_is_never_recorded_as_a_project() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("users").join("scott");
+    fs::create_dir_all(home.join("Documents")).unwrap();
+    fs::write(home.join("notes.txt"), "mine").unwrap();
+    // In the home folder, and in the folder that holds it: refused, and nothing is made.
+    for dir in [&home, &t.path().join("users")] {
+        for args in [&["save", "-w", "Start"][..], &["setup"], &["status"]] {
+            let (ok, out) = asqu_at_home(dir, &home, args, None);
+            assert!(!ok && out.contains("not a project") && out.contains("Go into a project's folder"), "{args:?}: {out}");
+        }
+        assert!(!dir.join(".asqu").exists());
+    }
+    // An AI tool started there is left alone: nothing is recorded and nothing is said.
+    let (ok, out) = asqu_at_home(&home, &home, &["event", "edit", "--ai", "Any AI"], Some("{}"));
+    assert!(ok && out.trim().is_empty(), "{out}");
+    assert!(!home.join(".asqu").exists());
+    // A folder inside it that isn't a project of anything else is one.
+    let (ok, out) = asqu_at_home(&home.join("Documents"), &home, &["save", "-w", "Start"], None);
+    assert!(ok, "{out}");
+    assert!(home.join("Documents/.asqu/store.db").is_file());
+}
+
+#[test]
+fn a_history_once_started_in_the_home_folder_is_no_longer_used() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("users").join("scott");
+    let project = home.join("code").join("shop");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(home.join("notes.txt"), "mine").unwrap();
+    fs::write(project.join("app.js"), "one").unwrap();
+    // As an earlier version did: a history for the whole home folder. (Made here by
+    // running Asqu as someone whose home is elsewhere.)
+    let (ok, out) = asqu_at_home(&home, &t.path().join("elsewhere"), &["save", "-w", "Start"], None);
+    assert!(ok, "{out}");
+    let before = fs::read(home.join(".asqu/store.db")).unwrap();
+
+    // There, Asqu says what happened and how to remove it, and changes nothing.
+    let (ok, out) = asqu_at_home(&home, &home, &["status"], None);
+    assert!(!ok && out.contains("by mistake") && out.contains("asqu remove"), "{out}");
+    // A project below it gets a history of its own instead of being recorded into it.
+    let (ok, out) = asqu_at_home(&project, &home, &["save", "-w", "Start"], None);
+    assert!(ok && out.contains("1 added"), "{out}");
+    assert!(project.join(".asqu/store.db").is_file());
+    assert_eq!(fs::read(home.join(".asqu/store.db")).unwrap(), before, "the old history is untouched");
+}
+
+#[test]
+fn a_home_folder_kept_in_git_is_still_a_project() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("users").join("scott");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".profile"), "settings").unwrap();
+    assert!(Command::new("git").args(["init", "-q"]).current_dir(&home).status().unwrap().success());
+    let (ok, out) = asqu_at_home(&home, &home, &["save", "-w", "Start"], None);
+    assert!(ok, "{out}");
+    assert!(home.join(".asqu/store.db").is_file());
+}
+
+/// Runs `asqu` with no terminal, a given home folder and a given own-settings folder.
+fn asqu_as(dir: &Path, home: &Path, settings: &Path, person: bool, args: &[&str]) -> (bool, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_asqu"));
+    cmd.args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("ASQU_HOME", settings)
+        .env("ASQU_AUTO_UPDATE", "0")
+        .env("ASQU_AUTO_BACKUP", "0")
+        .stdin(std::process::Stdio::null());
+    if person {
+        cmd.env("ASQU_TEST_PERSON", "1");
+    } else {
+        cmd.env_remove("ASQU_TEST_PERSON");
+    }
+    let out = cmd.output().unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+}
+
+#[test]
+fn looking_never_starts_a_history() {
+    let t = tempfile::tempdir().unwrap();
+    let (home, settings, dir) = (t.path().join("home"), t.path().join("settings"), t.path().join("somewhere"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), "one").unwrap();
+    for args in [&["status"][..], &["log"], &["summary"], &["verify"], &["try", "list"], &["tidy"], &["show", "1"], &["link"]] {
+        let (ok, out) = asqu_as(&dir, &home, &settings, false, args);
+        assert!(ok && out.contains("No history here yet"), "{args:?}: {out}");
+    }
+    // Asked to change something there is nothing of: said plainly, as a failure.
+    for args in [&["undo"][..], &["back", "#1"], &["mark", "v1"]] {
+        let (ok, out) = asqu_as(&dir, &home, &settings, false, args);
+        assert!(!ok && out.contains("No history here yet"), "{args:?}: {out}");
+    }
+    // The same for an AI tool that only looks.
+    let (ok, out) = asqu_as(&dir, &home, &settings, false, &["call", "asqu_status", "{}"]);
+    assert!(ok && out.contains("\"history\": false"), "{out}");
+    let (ok, out) = asqu_as(&dir, &home, &settings, false, &["call", "asqu_log", "{}"]);
+    assert!(ok && out.trim() == "[]", "{out}");
+    // The tool list needs no project at all.
+    assert!(asqu_as(&dir, &home, &settings, false, &["tools"]).0);
+    assert!(!dir.join(".asqu").exists(), "nothing was made");
+    // Saving is what starts one.
+    let (ok, out) = asqu_as(&dir, &home, &settings, false, &["save", "-w", "Start"]);
+    assert!(ok && dir.join(".asqu/store.db").is_file(), "{out}");
+    assert!(asqu_as(&dir, &home, &settings, false, &["log"]).1.contains("Start"));
+}
+
+#[test]
+fn remove_moves_the_history_aside_and_only_a_person_can_do_it() {
+    let t = tempfile::tempdir().unwrap();
+    let (home, settings, dir) = (t.path().join("home"), t.path().join("settings"), t.path().join("shop"));
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("a.txt"), "one").unwrap();
+    asqu_as(&dir, &home, &settings, false, &["save", "-w", "Start"]);
+    asqu_as(&dir, &home, &settings, false, &["setup", "--yes"]);
+    assert!(fs::read_to_string(dir.join("AGENTS.md")).unwrap().contains("asqu"));
+
+    // A preview changes nothing.
+    let (ok, out) = asqu_as(&dir, &home, &settings, false, &["remove", "--dry-run"]);
+    assert!(ok && out.contains("Timeline entr") && out.contains("nothing is deleted") && out.contains("Nothing was changed"), "{out}");
+    // An AI or a script can't do it, and it isn't one of the AI tools.
+    let (ok, out) = asqu_as(&dir, &home, &settings, false, &["remove"]);
+    assert!(!ok && out.contains("only the person"), "{out}");
+    assert!(!asqu_as(&dir, &home, &settings, false, &["call", "asqu_remove", "{}"]).0);
+    assert!(!asqu_as(&dir, &home, &settings, false, &["tools"]).1.contains("asqu_remove"));
+    assert!(dir.join(".asqu/store.db").is_file());
+
+    // The person does it, from a subfolder: the history is moved, not deleted.
+    let (ok, out) = asqu_as(&dir.join("src"), &home, &settings, true, &["remove"]);
+    assert!(ok && out.contains("Done."), "{out}");
+    assert!(!dir.join(".asqu").exists());
+    assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "one", "the person's files are untouched");
+    assert!(!fs::read_to_string(dir.join("AGENTS.md")).unwrap_or_default().contains("asqu"), "set-up undone");
+    let kept: Vec<_> = fs::read_dir(settings.join("removed")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].file_name().unwrap().to_string_lossy().starts_with("shop-") && kept[0].join("store.db").is_file());
+    assert!(asqu_as(&dir, &home, &settings, false, &["status"]).1.contains("No history here yet"));
+    let (ok, out) = asqu_as(&dir, &home, &settings, true, &["remove"]);
+    assert!(ok && out.contains("nothing to remove"), "{out}");
+
+    // Moved back, it is the same history again.
+    fs::rename(&kept[0], dir.join(".asqu")).unwrap();
+    assert!(asqu_as(&dir, &home, &settings, false, &["log"]).1.contains("Start"));
+}
+
+#[test]
+fn remove_in_the_home_folder_keeps_asqus_own_keys_and_settings() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("users").join("scott");
+    let settings = home.join(".asqu"); // where Asqu's own keys live by default
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("notes.txt"), "mine").unwrap();
+    // As an earlier version did: a history for the whole home folder.
+    let (ok, out) = asqu_as(&home, &t.path().join("elsewhere"), &settings, false, &["save", "-w", "Start"]);
+    assert!(ok, "{out}");
+    assert!(settings.join("store.db").is_file() && settings.join("identity.key").is_file());
+
+    let (ok, out) = asqu_as(&home, &home, &settings, true, &["remove"]);
+    assert!(ok && out.contains("Done."), "{out}");
+    assert!(!settings.join("store.db").exists(), "the history is gone from here");
+    assert!(settings.join("identity.key").is_file(), "Asqu's own key stays");
+    let kept: Vec<_> = fs::read_dir(settings.join("removed")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert!(kept.len() == 1 && kept[0].join("store.db").is_file());
+    assert_eq!(fs::read_to_string(home.join("notes.txt")).unwrap(), "mine");
+}

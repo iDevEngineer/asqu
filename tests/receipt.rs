@@ -208,6 +208,43 @@ fn nothing_on_a_computer_can_hide_a_file_from_a_receipt() {
     assert!(asqu(root, home.path(), &["verify", "--receipt"]).0);
 }
 
+#[test]
+fn names_asqu_leaves_out_cant_hide_project_files_from_a_receipt() {
+    let (dir, home) = project();
+    let root = dir.path();
+    assert!(asqu(root, home.path(), &["check", "--trust-check", "--save"]).0);
+
+    // Finder's own .DS_Store files come and go without breaking a receipt.
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/.DS_Store"), "finder\n").unwrap();
+    fs::write(root.join(".DS_Store"), "finder\n").unwrap();
+    let (ok, out) = asqu(root, home.path(), &["verify", "--receipt"]);
+    assert!(ok, "{out}");
+    fs::remove_file(root.join("src/.DS_Store")).unwrap();
+
+    // A folder with that name is not Finder's, and could hold code.
+    fs::create_dir_all(root.join("src/.DS_Store")).unwrap();
+    fs::write(root.join("src/.DS_Store/extra.js"), "extra\n").unwrap();
+    let (ok, out) = asqu(root, home.path(), &["verify", "--receipt"]);
+    assert!(!ok && out.contains("not a Finder file"), "{out}");
+    fs::remove_dir_all(root.join("src")).unwrap();
+
+    // A look-alike of a reserved name at the top is reported, not quietly left out.
+    fs::create_dir_all(root.join("git~1")).unwrap();
+    fs::write(root.join("git~1/extra.js"), "extra\n").unwrap();
+    let (ok, out) = asqu(root, home.path(), &["verify", "--receipt"]);
+    assert!(!ok && out.contains("a reserved name"), "{out}");
+    fs::remove_dir_all(root.join("git~1")).unwrap();
+
+    // So is the right name in different capitals (a separate folder on a case-sensitive disk).
+    fs::create_dir_all(root.join(".GIT")).unwrap();
+    fs::write(root.join(".GIT/extra.js"), "extra\n").unwrap();
+    let (ok, out) = asqu(root, home.path(), &["verify", "--receipt"]);
+    assert!(!ok && out.contains("a reserved name"), "{out}");
+    fs::remove_dir_all(root.join(".GIT")).unwrap();
+    assert!(asqu(root, home.path(), &["verify", "--receipt"]).0);
+}
+
 #[cfg(unix)]
 #[test]
 fn links_cant_smuggle_anything_past_a_receipt() {

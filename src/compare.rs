@@ -126,7 +126,7 @@ impl Store {
             }
             self.save_try(name, &who)?;
             let row = self.try_row(name)?;
-            let base = self.manifest_at(row.base_seq)?;
+            let base = self.base_of(&row)?;
             let theirs = self.manifest_from_hash(&row.manifest)?;
             let changes = Store::diff(&base, &theirs);
             let lines = self.line_totals(&base, &theirs, &changes)?;
@@ -178,9 +178,21 @@ impl Store {
                             eprintln!("asqu: allowed for now, but couldn't remember it ({e:#})");
                         }
                     }
-                    let dirs: Vec<_> = reports.iter().map(|r| self.try_dir(&r.name)).collect();
+                    // A worktree's folder is only used while it is still that worktree.
+                    let dirs: Vec<Option<std::path::PathBuf>> = reports
+                        .iter()
+                        .map(|r| self.try_row(&r.name).ok().filter(|row| self.folder_ok(row)).map(|_| self.try_dir(&r.name)))
+                        .collect();
                     let results: Vec<Result<CheckResult>> = std::thread::scope(|s| {
-                        let running: Vec<_> = dirs.iter().map(|d| s.spawn(|| run_check(cmd, d))).collect();
+                        let running: Vec<_> = dirs
+                            .iter()
+                            .map(|d| {
+                                s.spawn(move || match d {
+                                    Some(d) => run_check(cmd, d),
+                                    None => bail!("its folder is gone"),
+                                })
+                            })
+                            .collect();
                         running.into_iter().map(|h| h.join().unwrap_or_else(|_| bail!("the check crashed"))).collect()
                     });
                     for (r, result) in reports.iter_mut().zip(results) {

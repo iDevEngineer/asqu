@@ -135,7 +135,8 @@ enum Command {
         #[arg(long, default_value_t = asqu::serve::DEFAULT_PORT)]
         port: u16,
     },
-    /// Tries: separate attempts you (or any AI) can keep or toss
+    /// Tries: separate attempts you (or any AI) can keep or toss. A Git worktree of the
+    /// project (an AI tool's own working folder, say) is a Try by itself
     Try {
         #[command(subcommand)]
         cmd: TryCmd,
@@ -251,6 +252,13 @@ enum Command {
         #[arg(long)]
         ai: Option<String>,
     },
+    /// Take Asqu out of this folder: its history here is moved aside (not deleted) and its
+    /// AI tool set-up is undone. Your own files are never touched. Only a person can do this
+    Remove {
+        /// Show what would be removed, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show Asqu's licence (Fair Source, FSL-1.1-ALv2)
     License,
     /// Update Asqu to the newest version (it also updates itself automatically, at most once a day)
@@ -289,7 +297,7 @@ enum TryCmd {
     },
     /// Record what's in a Try's folder now
     Save {
-        /// Defaults to the Try whose folder you're in
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
         name: Option<String>,
         #[arg(short, long, default_value = "")]
         why: String,
@@ -308,6 +316,7 @@ enum TryCmd {
     },
     /// Combine a Try into the main project (after the Check and the risk rule)
     Keep {
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
         name: Option<String>,
         /// Approve a high-risk change
         #[arg(long)]
@@ -325,8 +334,23 @@ enum TryCmd {
         #[arg(long)]
         trust_check: bool,
     },
-    /// Throw a Try away (it can be brought back for 7 days)
-    Toss { name: Option<String> },
+    /// Bring a Try up to date with the main project (the main project's files aren't changed)
+    Update {
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
+        name: Option<String>,
+        /// Show what would change in the Try's folder, without changing any files
+        /// (unsaved work is saved first)
+        #[arg(long)]
+        dry_run: bool,
+        /// After a clash, which version of a file to keep: try:<file> or main:<file> (repeat for more files)
+        #[arg(long, value_name = "SIDE:FILE")]
+        take: Vec<String>,
+    },
+    /// Throw a Try away (it can be brought back for 7 days). A Git worktree's folder is left as it is
+    Toss {
+        /// Defaults to the Try whose folder you're in. For a Git worktree, its folder's name works too
+        name: Option<String>,
+    },
     /// Bring back a tossed Try
     Reopen { name: String },
 }
@@ -411,6 +435,117 @@ fn ask(question: &str) -> Result<String> {
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     Ok(answer.trim().to_string())
+}
+
+/// `asqu remove`: takes Asqu out of the folder. Nothing is deleted: the history is moved
+/// to the person's own Asqu folder, from where it can be put back.
+fn remove_command(dry_run: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let root = match Store::find_root(&cwd) {
+        Some(root) => root.canonicalize()?,
+        // One started by mistake in a folder too wide to be a project (the home folder).
+        None if cwd.join(asqu::store::DIR).join("store.db").is_file() => cwd.clone(),
+        None => {
+            println!("Asqu keeps no history here, so there is nothing to remove.");
+            return Ok(());
+        }
+    };
+    // In a Try's own folder (a Git worktree): the history is the main project's.
+    if let Some(copy) = Store::files_root(&cwd).and_then(|c| c.canonicalize().ok()).filter(|c| *c != root) {
+        if asqu::worktree::main_of(&copy).is_some_and(|main| main == root) {
+            anyhow::bail!(
+                "This folder is a Try of {}. To drop the Try: `asqu try toss`. To take Asqu out of the whole project, \
+                 run `asqu remove` in {}.",
+                root.display(),
+                root.display()
+            );
+        }
+    }
+    let dir = root.join(asqu::store::DIR);
+    let home = asqu::sign::home().context("can't find your own Asqu folder to move the history to")?;
+    // In the home folder, the history shares its folder with Asqu's own keys and settings:
+    // only the history's files are moved.
+    let shared = home.canonicalize().ok() == dir.canonicalize().ok();
+    let count = |sql: &str| -> i64 {
+        rusqlite::Connection::open_with_flags(dir.join("store.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|c| c.query_row(sql, [], |r| r.get(0)))
+            .unwrap_or(0)
+    };
+    let (entries, tries) = (count("SELECT COUNT(*) FROM timeline"), count("SELECT COUNT(*) FROM tries WHERE status = 'open'"));
+    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+    let dest = home.join("removed").join(format!("{name}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+
+    println!("Asqu's history for {}:", root.display());
+    println!("  {entries} Timeline entr{}, {tries} open Tr{}.", if entries == 1 { "y" } else { "ies" }, if tries == 1 { "y" } else { "ies" });
+    println!("Removing it:");
+    println!("  - moves that history to {} (nothing is deleted)", dest.display());
+    println!("  - takes Asqu's notes and hooks for AI tools out of this folder");
+    println!("  - leaves your own files exactly as they are, and any backups where they are");
+    println!("After that, Asqu can undo nothing here. To bring the history back, move that folder back to {}.", dir.display());
+    if dry_run {
+        println!("Nothing was changed.");
+        return Ok(());
+    }
+    if !asqu::platform::person_confirms("Take Asqu out of this folder?")? {
+        println!("Not removed.");
+        return Ok(());
+    }
+
+    for (file, changed) in asqu::setup::remove(&root).unwrap_or_default() {
+        if changed {
+            println!("Removed Asqu's notes from {file}.");
+        }
+    }
+    for file in asqu::aitools::remove_all(&root).unwrap_or_default() {
+        println!("Removed Asqu's hooks from {}.", file.strip_prefix(&root).unwrap_or(&file).display());
+    }
+    // Fold everything into the one history file before it is moved.
+    if let Ok(conn) = rusqlite::Connection::open(dir.join("store.db")) {
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    }
+    if shared {
+        std::fs::create_dir_all(&dest)?;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if file.starts_with("store") || matches!(file.as_str(), "large" | "tries" | "backup-state.json" | "receipt.json") {
+                move_aside(&entry.path(), &dest.join(&file))?;
+            }
+        }
+    } else {
+        std::fs::create_dir_all(dest.parent().context("no folder to move the history to")?)?;
+        move_aside(&dir, &dest)?;
+    }
+    println!("Done. Asqu's history for this folder is now in {}.", dest.display());
+    Ok(())
+}
+
+/// Moves a file or folder, also to another disk (where it is copied, then the original
+/// removed). Links are never followed.
+fn move_aside(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    fn copy(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        let meta = std::fs::symlink_metadata(from)?;
+        if meta.is_dir() {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                copy(&entry.path(), &to.join(entry.file_name()))?;
+            }
+        } else if meta.is_file() {
+            std::fs::copy(from, to)?;
+        }
+        Ok(())
+    }
+    copy(from, to).with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+    if std::fs::symlink_metadata(from)?.is_dir() {
+        std::fs::remove_dir_all(from)?;
+    } else {
+        std::fs::remove_file(from)?;
+    }
+    Ok(())
 }
 
 fn setup_command(store: &mut Store, yes: bool, remove: bool, ai: Vec<String>, list: bool) -> Result<()> {
@@ -537,10 +672,41 @@ fn claude_md_hint(root: &std::path::Path) {
 /// The named Try, or the one whose folder we're in.
 fn pick_try(store: &Store, name: Option<String>) -> Result<String> {
     match name {
-        Some(n) => Ok(n),
+        // A worktree's Try is named after its folder, tidied up: the folder's own name
+        // (or path) is accepted too.
+        Some(n) => store.try_named(&n),
         None => store
             .try_for_path(&std::env::current_dir()?)
             .context("Which Try? Give its name (see `asqu try list`), or run this inside its folder."),
+    }
+}
+
+/// `--take try:<file>` / `--take main:<file>`, as a choice per file.
+fn takes(take: &[String]) -> Result<std::collections::BTreeMap<String, asqu::tries::Side>> {
+    let mut chosen = std::collections::BTreeMap::new();
+    for t in take {
+        let (side, file) = t
+            .split_once(':')
+            .and_then(|(s, f)| Some((asqu::tries::Side::parse(s)?, f)))
+            .filter(|(_, f)| !f.is_empty())
+            .with_context(|| format!("--take {t}: write try:<file> or main:<file>"))?;
+        if chosen.insert(file.to_string(), side).is_some_and(|before| before != side) {
+            anyhow::bail!("--take names {file} twice, once for each side: choose one");
+        }
+    }
+    Ok(chosen)
+}
+
+/// What each side has, for every file the Try and the main project changed differently.
+fn print_clashes(questions: &[asqu::tries::Clash]) {
+    for q in questions {
+        println!("\n{}: {}.", printable(&q.path), q.what);
+        for p in &q.parts {
+            println!("  Around line {}, the main project now has:", p.line);
+            print_quoted(&p.main);
+            println!("  The Try has:");
+            print_quoted(&p.try_text);
+        }
     }
 }
 
@@ -548,6 +714,11 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
     use asqu::tries::{KeepOptions, KeepOutcome};
     match cmd {
         TryCmd::Start { names, why } => {
+            if let Some(here) = store.try_for_path(&std::env::current_dir()?) {
+                println!(
+                    "Note: this folder is already Try \"{here}\". A new Try starts from the main project and won't hold the work done here."
+                );
+            }
             for (name, dir) in names.iter().zip(store.start_tries(&names, &why, &actor())?) {
                 println!("Started Try \"{name}\". Work in:\n  {}", dir.display());
             }
@@ -616,20 +787,67 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
             for t in tries {
                 let what = if t.request.is_empty() { String::new() } else { format!("  \"{}\"", printable(&t.request)) };
                 println!("{:<20} {:<7} from #{:<4} {} file(s) changed{what}", t.name, t.status, t.base_seq, t.changed);
+                if t.worktree {
+                    let gone = if t.folder_gone { " (that worktree was removed: Asqu has its work as last saved)" } else { "" };
+                    println!("{:<20} Git worktree: {}{gone}", "", printable(&t.path.display().to_string()));
+                }
+                if let Some(who) = store.reopened_by(&t.name).filter(|_| t.status == "open") {
+                    println!("{:<20} tossed earlier; opened again by more work in its folder ({})", "", printable(&who));
+                }
+            }
+        }
+        TryCmd::Update { name, dry_run, take } => {
+            use asqu::tries::UpdateOutcome;
+            let name = pick_try(store, name)?;
+            let chosen = takes(&take)?;
+            match store.update_try(&name, &chosen, dry_run, &actor())? {
+                UpdateOutcome::UpToDate => println!("Try \"{name}\" already has everything in the main project."),
+                UpdateOutcome::Updated { changes, dry_run } => {
+                    if dry_run {
+                        println!("Bringing Try \"{name}\" up to date would change these files in its folder:");
+                    } else {
+                        println!("Try \"{name}\" is up to date with the main project. Changed in its folder:");
+                    }
+                    if changes.is_empty() {
+                        println!("  nothing (its files stay as they are).");
+                    }
+                    for p in &changes.added {
+                        println!("  added     {}", printable(p));
+                    }
+                    for p in &changes.modified {
+                        println!("  changed   {}", printable(p));
+                    }
+                    for p in &changes.deleted {
+                        println!("  removed   {}", printable(p));
+                    }
+                    if dry_run {
+                        println!("No files were changed. Run it without --dry-run to do it.");
+                    }
+                }
+                UpdateOutcome::Clash { files, questions } => {
+                    println!(
+                        "Can't bring it up to date yet: the Try and the main project both changed {} in ways that can't be combined. No files were changed.",
+                        if files.len() == 1 { "1 file".to_string() } else { format!("{} files", files.len()) }
+                    );
+                    print_clashes(&questions);
+                    let mut again = format!("asqu try update {name}");
+                    for (path, side) in &chosen {
+                        let side = if *side == asqu::tries::Side::Try { "try" } else { "main" };
+                        again += &format!(" --take {side}:{}", shell_word(path).unwrap_or_else(|| "<file>".into()));
+                    }
+                    let q = shell_word(&files[0]).unwrap_or_else(|| "<file>".into());
+                    println!("\nChoose which to keep for each file, then update again, e.g.:");
+                    println!("  {again} --take try:{q}     (the Try's version)");
+                    println!("  {again} --take main:{q}    (the main project's version)");
+                    std::process::exit(1);
+                }
             }
         }
         TryCmd::Keep { name, yes, no_check, prefer_try, take, trust_check } => {
             let name = pick_try(store, name)?;
-            let mut chosen = std::collections::BTreeMap::new();
-            for t in &take {
-                let (side, file) = t
-                    .split_once(':')
-                    .and_then(|(s, f)| Some((asqu::tries::Side::parse(s)?, f)))
-                    .filter(|(_, f)| !f.is_empty())
-                    .with_context(|| format!("--take {t}: write try:<file> or main:<file>"))?;
-                if chosen.insert(file.to_string(), side).is_some_and(|before| before != side) {
-                    anyhow::bail!("--take names {file} twice, once for each side: choose one");
-                }
+            let chosen = takes(&take)?;
+            if store.list_tries()?.iter().any(|t| t.name == name && t.status == "open" && t.folder_gone) {
+                println!("The worktree folder for Try \"{name}\" is gone, so this keeps it as it was last saved.");
             }
             // Approvals only count for exactly what the person was shown: ask about the
             // result as it is now, then keep that result (if it changed meanwhile, ask again).
@@ -680,22 +898,18 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
                         None if no_check => println!("Check skipped."),
                         None => println!("No check is set up. Add `check = \"...\"` to asqu.toml to test before keeping."),
                     }
-                    println!("Undo with `asqu undo`.");
+                    if store.try_for_path(&std::env::current_dir()?).is_some() {
+                        println!("To undo, run `asqu undo` in the main project's folder: {}", store.root().display());
+                    } else {
+                        println!("Undo with `asqu undo`.");
+                    }
                 }
                 KeepOutcome::Clash { files, questions } => {
                     println!(
                         "Can't keep yet: the Try and the main project both changed {} in ways that can't be combined.",
                         if files.len() == 1 { "1 file".to_string() } else { format!("{} files", files.len()) }
                     );
-                    for q in &questions {
-                        println!("\n{}: {}.", printable(&q.path), q.what);
-                        for p in &q.parts {
-                            println!("  Around line {}, the main project now has:", p.line);
-                            print_quoted(&p.main);
-                            println!("  The Try has:");
-                            print_quoted(&p.try_text);
-                        }
-                    }
+                    print_clashes(&questions);
                     // The command to run next keeps the choices already made.
                     let mut again = format!("asqu try keep {name}");
                     for (path, side) in &chosen {
@@ -732,8 +946,12 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
         }
         TryCmd::Toss { name } => {
             let name = pick_try(store, name)?;
+            let worktree = store.list_tries()?.iter().any(|t| t.name == name && t.worktree);
             store.toss_try(&name, &actor())?;
             println!("Tossed Try \"{name}\". Changed your mind? `asqu try reopen {name}` (for 7 days).");
+            if worktree {
+                println!("Its Git worktree folder is left exactly as it is. If work carries on there, the Try opens again.");
+            }
         }
         TryCmd::Reopen { name } => {
             let dir = if store.try_is_set_aside(&name)? {
@@ -895,7 +1113,8 @@ fn release_command(store: &mut Store, version: &str, dry_run: bool) -> Result<()
 /// Needs no history, and never creates one or a key, so it can run anywhere.
 fn verify_receipt(file: &std::path::Path, keys: &[String], clean: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let root = Store::find_root(&cwd).unwrap_or(cwd);
+    // The files here, even in a worktree recorded as a Try of another folder.
+    let root = Store::files_root(&cwd).unwrap_or(cwd);
     let text = std::fs::read_to_string(file).with_context(|| format!("can't read the receipt {}", file.display()))?;
     let receipt = asqu::receipt::Receipt::parse(&text)?;
 
@@ -1138,6 +1357,11 @@ fn main() -> Result<()> {
             print!("{}", include_str!("../LICENSE"));
             return Ok(());
         }
+        Command::Remove { dry_run } => return remove_command(*dry_run),
+        Command::Tools { format } => {
+            println!("{}", serde_json::to_string_pretty(&asqu::tools::export(format)?)?);
+            return Ok(());
+        }
         Command::SignRelease { files } => return asqu::update::sign_release(files),
         Command::ReleaseKeygen { secret_file } => {
             println!("{}", asqu::update::new_release_key(secret_file)?);
@@ -1188,7 +1412,50 @@ fn main() -> Result<()> {
         asqu::update::maybe_start_auto_update();
     }
 
-    let mut store = Store::open_or_create(&std::env::current_dir()?)?;
+    // Looking never starts a history: one begins only when there is something to record.
+    let cwd = std::env::current_dir()?;
+    if Store::find_root(&cwd).is_none() {
+        let asks_for_change = matches!(
+            cli.command,
+            Command::Undo { .. } | Command::Back { .. } | Command::Mark { .. } | Command::Unlink { .. }
+        );
+        let only_looks = matches!(
+            cli.command,
+            Command::Status
+                | Command::Log { .. }
+                | Command::Show { .. }
+                | Command::Summary { .. }
+                | Command::Verify { .. }
+                | Command::Tidy { .. }
+                | Command::Backup { .. }
+                | Command::Link { place: None, .. }
+                | Command::Try { cmd: TryCmd::List }
+        );
+        // An AI tool that only looks gets its answer without a history being made.
+        if let Command::Call { tool, args } = &cli.command {
+            if matches!(tool.as_str(), "asqu_status" | "asqu_log" | "asqu_try_list") {
+                let _ = args;
+                let answer = asqu::tools::call(&cwd, tool, &serde_json::json!({}), &actor())?;
+                println!("{}", serde_json::to_string_pretty(&answer)?);
+                return Ok(());
+            }
+        }
+        if only_looks || asks_for_change {
+            let top = cwd.ancestors().find(|d| asqu::store::is_working_copy(d)).unwrap_or(&cwd);
+            if let Some(why) = Store::not_a_project(top) {
+                anyhow::bail!("{why}");
+            }
+            const NONE_YET: &str = "No history here yet. Asqu starts one by itself the first time something is saved \
+                                    here (`asqu save`, or an AI tool's first edit).";
+            if asks_for_change {
+                anyhow::bail!("{NONE_YET}");
+            }
+            println!("{NONE_YET}");
+            return Ok(());
+        }
+    }
+
+    let mut store = Store::open_or_create(&cwd)?;
     let project_root = store.root().to_path_buf();
 
     match cli.command {
@@ -1198,6 +1465,7 @@ fn main() -> Result<()> {
         | Command::SignRelease { .. }
         | Command::ReleaseKeygen { .. }
         | Command::Restore { .. }
+        | Command::Remove { .. }
         | Command::License => unreachable!(),
         Command::Link { place: Some(place), hub, project, agent, all, .. } if place == "hub" => {
             if all {
@@ -1348,6 +1616,49 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Run { name, command } if store.try_for_path(&std::env::current_dir()?).is_some() => {
+            // Inside a Try's folder: what the program changes there belongs to the Try.
+            let in_try = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
+            let name = name.unwrap_or_else(|| asqu::run::default_name(&command));
+            let program = command.first().context("no command given")?;
+            eprintln!("asqu: recording changes made by {name} in Try \"{in_try}\"…");
+            store.save_try(&in_try, &Why { actor: actor(), ..Default::default() })?; // earlier changes aren't the program's
+            let status = std::process::Command::new(program)
+                .args(&command[1..])
+                .status()
+                .with_context(|| format!("couldn't run {program}"))?;
+            let c = store.save_try(&in_try, &Why { actor: actor(), agent: Some(name.clone()), ..Default::default() })?;
+            if c.is_empty() {
+                eprintln!("asqu: {name} didn't change any files.");
+            } else {
+                eprintln!("asqu: {name} changed {} file(s), saved in Try \"{in_try}\". Keep them with `asqu try keep {in_try}`.", c.count());
+            }
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Command::Watch { settle } if store.try_for_path(&std::env::current_dir()?).is_some() => {
+            let in_try = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
+            let dir = store.try_dir(&in_try);
+            println!("Asqu is watching Try \"{in_try}\" ({}) — changes are saved in the Try automatically. Ctrl+C to stop.", dir.display());
+            let mut save = || -> Result<()> {
+                let c = store.save_try(&in_try, &Why { actor: actor(), ..Default::default() })?;
+                if !c.is_empty() {
+                    println!("  saved {} file(s) in Try \"{in_try}\"", c.count());
+                }
+                Ok(())
+            };
+            save()?;
+            asqu::watch::run(&dir, std::time::Duration::from_secs(settle), save)?;
+        }
+        Command::Check { .. } | Command::Release { .. } | Command::Mark { .. }
+            if store.try_for_path(&std::env::current_dir()?).is_some() =>
+        {
+            let name = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
+            anyhow::bail!(
+                "You're in the folder of Try \"{name}\". This command works on the main project, so run it from its folder: {}\n\
+                 The Try's work reaches the main project when you keep it: `asqu try keep {name}`.",
+                store.root().display()
+            );
+        }
         Command::Run { name, command } => {
             let name = name.unwrap_or_else(|| asqu::run::default_name(&command));
             eprintln!("asqu: recording changes made by {name}…");
@@ -1364,6 +1675,10 @@ fn main() -> Result<()> {
             }
             std::process::exit(r.exit_code);
         }
+        Command::Undo { .. } | Command::Back { .. } if store.try_for_path(&std::env::current_dir()?).is_some() => {
+            let name = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
+            anyhow::bail!("{}", store.main_only_note(&name));
+        }
         Command::Undo { steps, dry_run } => {
             let target = asqu::tools::undo_target(&store, steps)?;
             go_back(&mut store, target, dry_run)?;
@@ -1375,8 +1690,15 @@ fn main() -> Result<()> {
         Command::Try { cmd } => try_command(&mut store, cmd)?,
         Command::Intent { request, clear } => {
             if clear {
-                store.clear_intent();
+                match store.try_for_path(&std::env::current_dir()?) {
+                    Some(name) => store.clear_try_intent(&name)?,
+                    None => store.clear_intent(),
+                }
                 println!("Cleared the current request.");
+            } else if let Some(name) = store.try_for_path(&std::env::current_dir()?) {
+                let request = request.context("say what the person asked for, e.g. asqu intent \"Make signup faster\"")?;
+                store.set_try_intent(&name, &request)?;
+                println!("Got it. Changes in Try \"{name}\" will be saved as: \"{}\"", request.trim());
             } else {
                 let request = request.context("say what the person asked for, e.g. asqu intent \"Make signup faster\"")?;
                 store.set_intent(&request)?;
@@ -1471,6 +1793,8 @@ fn main() -> Result<()> {
             };
             let root = store.root().to_path_buf();
             drop(store);
+            // Called from inside a Try's folder (a worktree, say), a tool acts on that Try.
+            asqu::tools::set_caller_folder(&std::env::current_dir()?);
             match asqu::tools::call(&root, &tool, &args, &actor()) {
                 Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
                 Err(e) => {
@@ -1503,6 +1827,27 @@ fn main() -> Result<()> {
             save()?;
             asqu::watch::run(&root, std::time::Duration::from_secs(settle), save)?;
         }
+        Command::Status if store.try_for_path(&std::env::current_dir()?).is_some() => {
+            let name = store.try_for_path(&std::env::current_dir()?).unwrap_or_default();
+            let state = store.list_tries()?.into_iter().find(|t| t.name == name).map(|t| t.status).unwrap_or_default();
+            let c = store.try_changes(&name)?;
+            println!("This folder is Try \"{name}\" ({state}) of the main project in {}.", store.root().display());
+            if c.is_empty() {
+                println!("Nothing here differs from where it started.");
+            } else {
+                for p in &c.added {
+                    println!("  added     {}", printable(p));
+                }
+                for p in &c.modified {
+                    println!("  changed   {}", printable(p));
+                }
+                for p in &c.deleted {
+                    println!("  removed   {}", printable(p));
+                }
+                println!("{} file(s) differ from where it started.", c.count());
+            }
+            println!("Keep its work: `asqu try keep {name}`. Bring in the main project's changes: `asqu try update {name}`.");
+        }
         Command::Status => {
             let c = store.status()?;
             tell_skipped(&store);
@@ -1519,6 +1864,16 @@ fn main() -> Result<()> {
                     println!("  removed   {p}");
                 }
                 println!("{} file(s) changed.", c.count());
+            }
+            let open = store.open_tries()?;
+            if !open.is_empty() {
+                let names: Vec<String> =
+                    open.iter().map(|(n, gone)| if *gone { format!("{n} (folder removed)") } else { n.clone() }).collect();
+                println!(
+                    "{}: {}. See `asqu try list`.",
+                    if open.len() == 1 { "1 open Try".to_string() } else { format!("{} open Tries", open.len()) },
+                    printable(&names.join(", "))
+                );
             }
             for line in asqu::backup::status_lines(store.root()) {
                 println!("{line}");

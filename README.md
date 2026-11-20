@@ -52,6 +52,7 @@ Run `asqu --help` for everything else, or `sh demo.sh` for a 5-minute guided tou
 - **Works with any AI tool.** `asqu setup` adds a note to AGENTS.md; `asqu tools` gives any model Asqu's actions as tool definitions; `asqu serve` gives a local web API.
 - **Signed checks.** `asqu check` runs your tests and signs a receipt for the exact files that passed; `asqu release` only releases those files.
 - **Your work stays yours.** History lives on your computer and in backup places you choose (a folder, iCloud Drive, Dropbox, a disk, or S3-style storage). Your work is never sent to us.
+- **Starts and leaves cleanly.** There is no set-up step: a history starts in a project's folder the first time something is saved there (looking, as with `asqu status`, never starts one, and your home folder is never treated as a project). `asqu remove` takes Asqu out of a folder again: the history is moved aside, not deleted, your files are untouched, and only you can do it, never an AI.
 - **AsquHub (optional).** `asqu link hub` shares a project on [AsquHub](https://asquhub.com), the hosted home for people and AI agents working together.
 
 ## Already using Git?
@@ -61,7 +62,7 @@ You don't have to switch, and nothing in your project changes. Asqu works in the
 - **Your `.gitignore` already works.** Asqu skips the same files Git does. Add an `.asquignore` (same format) only if you want Asqu to skip more.
 - **Git never sees Asqu.** Asqu's history lives in a `.asqu` folder that it keeps out of `git status` by itself, without touching your `.gitignore`, so nothing changes for teammates.
 - **Keep committing and pushing as before**, or stop when you no longer need to. Asqu's Timeline starts from the day you first use it; your earlier Git history stays in Git.
-- **Git worktrees are understood.** A worktree an AI tool makes inside your project is treated as its own project, not saved twice.
+- **A Git worktree is a Try.** A Git worktree is a second working folder of the same project, which AI tools often make to work in. Asqu records the work in any worktree as a Try of the main project by itself, starting the main project's history if there isn't one yet. `asqu try keep` combines it, with no branch, pull request or merge, and `asqu try update` brings in what changed in the main project meanwhile. Asqu never removes the worktree's folder or touches its Git branch; if the folder is removed, Asqu still has its work as last saved. Undo and going back are run from the main project's folder. A worktree that already had its own Asqu history stays a separate project, as does one that holds only part of the project.
 
 ## Build from source
 

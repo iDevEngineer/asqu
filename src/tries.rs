@@ -25,6 +25,24 @@ pub struct TryInfo {
     pub path: PathBuf,
     /// Files that differ from where the Try started.
     pub changed: usize,
+    /// A git worktree (e.g. one an AI tool made) linked as this Try: its folder is git's,
+    /// and Asqu never removes it.
+    pub worktree: bool,
+    /// The worktree's folder is gone (or no longer a worktree of this project): the Try
+    /// stands as it was last saved.
+    pub folder_gone: bool,
+}
+
+/// What `asqu try update` did (or would do).
+#[derive(Debug)]
+pub enum UpdateOutcome {
+    /// The Try already has everything the main project has.
+    UpToDate,
+    /// The Try's folder now holds the main project's changes too (`changes` is what was
+    /// written there). With `dry_run`, nothing was written.
+    Updated { changes: Changes, dry_run: bool },
+    /// Both sides changed the same lines: nothing was changed. Choose per file with `take`.
+    Clash { files: Vec<String>, questions: Vec<Clash> },
 }
 
 #[derive(Debug, Clone)]
@@ -118,11 +136,21 @@ pub struct KeepOptions {
     pub trust_check: bool,
 }
 
+/// A Try's row as stored: starting entry, status, request, files, folder, starting point.
+type StoredRow = (i64, String, String, Vec<u8>, Option<String>, Option<Vec<u8>>, Option<String>);
+
 pub(crate) struct Row {
     pub base_seq: i64,
     pub status: String,
     pub request: String,
     pub manifest: Hash,
+    /// For a git worktree linked as a Try: its folder.
+    pub path: Option<PathBuf>,
+    /// Which worktree that is (`worktree::identity`). A folder is only this Try's while
+    /// it holds that same worktree.
+    pub wt_id: Option<String>,
+    /// Where the Try started, as a stored set of files (None: the entry `base_seq`).
+    pub base: Option<Hash>,
 }
 
 fn valid_name(name: &str) -> Result<()> {
@@ -140,48 +168,365 @@ fn valid_name(name: &str) -> Result<()> {
 }
 
 impl Store {
-    /// A Try's folder. Callers only pass names that passed `valid_name` (via `try_row`).
-    pub fn try_dir(&self, name: &str) -> PathBuf {
+    /// The folder Asqu makes for a Try inside `.asqu`. The only Try folder Asqu ever removes.
+    fn own_folder(&self, name: &str) -> PathBuf {
         debug_assert!(valid_name(name).is_ok());
         self.root().join(DIR).join("tries").join(name)
     }
 
-    /// The Try whose folder contains `path`, if any.
+    /// A Try's folder: the one inside `.asqu`, or for a linked git worktree, the worktree.
+    /// Callers only pass names that passed `valid_name` (via `try_row`).
+    pub fn try_dir(&self, name: &str) -> PathBuf {
+        match self.try_row(name) {
+            Ok(Row { path: Some(p), .. }) => p,
+            _ => self.own_folder(name),
+        }
+    }
+
+    /// Removes the folder Asqu made for a Try. A linked worktree's folder belongs to git
+    /// (and to whoever is working there): it is never removed or emptied.
+    fn remove_own_folder(&self, name: &str) {
+        if valid_name(name).is_ok() && !matches!(self.try_row(name), Ok(Row { path: Some(_), .. })) {
+            let _ = fs::remove_dir_all(self.own_folder(name));
+        }
+    }
+
+    /// Is the Try's folder there to read and write? Always for a Try inside `.asqu`. A
+    /// linked worktree must still be a confirmed worktree of this project: the stored path
+    /// alone is never trusted (it could come from a changed backup, or the folder may have
+    /// been removed or replaced).
+    pub(crate) fn folder_ok(&self, row: &Row) -> bool {
+        match &row.path {
+            None => true,
+            Some(p) => {
+                crate::worktree::main_of(p).is_some_and(|main| main == self.root())
+                    && row.wt_id.is_some()
+                    && crate::worktree::identity(p) == row.wt_id
+            }
+        }
+    }
+
+    /// The files a Try started from.
+    pub(crate) fn base_of(&self, row: &Row) -> Result<Manifest> {
+        match &row.base {
+            Some(h) => self.manifest_from_hash(h),
+            None => self.manifest_at(row.base_seq),
+        }
+    }
+
+    /// The Try a linked worktree is recorded as, if it has been linked. `top` is the
+    /// worktree's top folder in its full, real form. A worktree is known by what it is,
+    /// not where: one that was moved keeps its Try (the new folder is noted), and a new
+    /// worktree made where an old one used to be is a new Try, never the old one's.
+    pub(crate) fn worktree_try(&self, top: &Path) -> Result<Option<String>> {
+        let Some(id) = crate::worktree::identity(top) else { return Ok(None) };
+        let found: Option<(String, Option<String>)> = self
+            .conn
+            .query_row("SELECT name, path FROM tries WHERE wt_id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((name, path)) = found.filter(|(n, _)| valid_name(n).is_ok()) else { return Ok(None) };
+        let here = top.to_string_lossy();
+        if path.as_deref() != Some(&*here) {
+            self.conn.execute("UPDATE tries SET path = ?1 WHERE name = ?2", params![here, name])?;
+        }
+        Ok(Some(name))
+    }
+
+    /// The Try whose folder contains `path`, if any: an open Try inside `.asqu`, or a
+    /// linked worktree (open or not: more work there opens it again).
     pub fn try_for_path(&self, path: &Path) -> Option<String> {
         let path = path.canonicalize().ok()?;
-        let rest = path.strip_prefix(self.root().join(DIR).join("tries")).ok()?;
-        let name = rest.components().next()?.as_os_str().to_string_lossy().into_owned();
-        self.try_row(&name).ok().filter(|r| r.status == "open").map(|_| name)
+        if let Ok(rest) = path.strip_prefix(self.root().join(DIR).join("tries")) {
+            let name = rest.components().next()?.as_os_str().to_string_lossy().into_owned();
+            return self.try_row(&name).ok().filter(|r| r.status == "open" && r.path.is_none()).map(|_| name);
+        }
+        let top = path.ancestors().find(|d| crate::store::is_working_copy(d))?;
+        if top == self.root() {
+            return None;
+        }
+        let name = self.worktree_try(top).ok()??;
+        self.try_row(&name).ok().filter(|r| self.folder_ok(r)).map(|_| name)
     }
 
     pub(crate) fn try_row(&self, name: &str) -> Result<Row> {
         valid_name(name)?; // never build a folder path from an unsafe name, wherever it came from
         self.conn
             .query_row(
-                "SELECT base_seq, status, request, manifest FROM tries WHERE name = ?1",
+                "SELECT base_seq, status, request, manifest, path, base, wt_id FROM tries WHERE name = ?1",
                 [name],
                 |r| {
                     let m: Vec<u8> = r.get(3)?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, m))
+                    let path: Option<String> = r.get(4)?;
+                    let base: Option<Vec<u8>> = r.get(5)?;
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, m, path, base, r.get(6)?))
                 },
             )
             .optional()?
-            .map(|(base_seq, status, request, m): (i64, String, String, Vec<u8>)| {
+            .map(|(base_seq, status, request, m, path, base, wt_id): StoredRow| {
                 Ok::<_, anyhow::Error>(Row {
                     base_seq,
                     status,
                     request,
                     manifest: hash::from_slice(&m).context("bad hash")?,
+                    path: path.map(PathBuf::from),
+                    wt_id,
+                    base: base.map(|b| hash::from_slice(&b).context("bad hash")).transpose()?,
                 })
             })
             .transpose()?
-            .with_context(|| format!("there's no Try called \"{name}\""))
+            .with_context(|| format!("there's no Try called \"{name}\" (see `asqu try list`)"))
+            .map(|row| self.follow_moved_worktree(name, row))
+    }
+
+    /// A worktree that was moved (`git worktree move`): git's own entry says where it is
+    /// now. Confirmed like any worktree before the new folder is used.
+    fn follow_moved_worktree(&self, name: &str, mut row: Row) -> Row {
+        if let (Some(_), Some(id)) = (&row.path, &row.wt_id) {
+            if !self.folder_ok(&row) {
+                if let Some(now) = crate::worktree::find_by_identity(self.root(), id) {
+                    if self.conn.execute("UPDATE tries SET path = ?1 WHERE name = ?2", params![now.to_string_lossy(), name]).is_ok() {
+                        row.path = Some(now);
+                    }
+                }
+            }
+        }
+        row
+    }
+
+    /// Open Tries by name, and whether each one's folder is missing. Reads no files.
+    pub fn open_tries(&self) -> Result<Vec<(String, bool)>> {
+        let mut stmt = self.conn.prepare("SELECT name FROM tries WHERE status = 'open' ORDER BY name")?;
+        let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(names
+            .into_iter()
+            .filter_map(|n| self.try_row(&n).ok().map(|row| (n, !self.folder_ok(&row))))
+            .collect())
+    }
+
+    /// The Try a person means by `asked`: its name, or for a worktree, its folder's name
+    /// or path. Says so when two worktrees' folders share that name.
+    pub fn try_named(&self, asked: &str) -> Result<String> {
+        if valid_name(asked).is_ok() && self.try_row(asked).is_ok() {
+            return Ok(asked.to_string());
+        }
+        // The same name in other capitals (names are unique whatever the capitals).
+        if valid_name(asked).is_ok() {
+            let other: Option<String> =
+                self.conn.query_row("SELECT name FROM tries WHERE name = ?1 COLLATE NOCASE", params![asked], |r| r.get(0)).optional()?;
+            if let Some(name) = other {
+                return Ok(name);
+            }
+        }
+        // (Never looked up when written like a place on another computer.)
+        let as_path = Some(asked).filter(|a| !crate::worktree::names_another_computer(a)).and_then(|a| Path::new(a).canonicalize().ok());
+        let mut stmt = self.conn.prepare("SELECT name FROM tries WHERE path IS NOT NULL ORDER BY name")?;
+        let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let found: Vec<String> = names
+            .into_iter()
+            .filter(|n| {
+                self.try_row(n).ok().and_then(|r| r.path).is_some_and(|p| {
+                    as_path.as_deref() == Some(p.as_path()) || p.file_name().is_some_and(|f| f == std::ffi::OsStr::new(asked))
+                })
+            })
+            .collect();
+        // Several: the one whose folder is really there now (an earlier Try of a worktree
+        // that was removed keeps the folder's name).
+        let live: Vec<&String> =
+            found.iter().filter(|n| self.try_row(n).is_ok_and(|r| r.status == "open" && self.folder_ok(&r))).collect();
+        if let ([_, _, ..], [one]) = (found.as_slice(), live.as_slice()) {
+            return Ok((*one).clone());
+        }
+        match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Ok(asked.to_string()), // not a folder either: the usual "no Try called" follows
+            many => bail!(
+                "more than one Try's folder is called \"{asked}\": {}. Use the Try's own name (see `asqu try list`).",
+                many.join(", ")
+            ),
+        }
+    }
+
+    /// Links a confirmed git worktree as a Try of this project, starting from `commit`
+    /// (see `worktree::base_commit`). Nothing in the worktree is changed.
+    pub(crate) fn link_worktree(&mut self, top: &Path, commit: &str) -> Result<String> {
+        if let Some(name) = self.worktree_try(top)? {
+            return Ok(name);
+        }
+        // A project used for the first time through a worktree: start its history now.
+        if self.head_seq()?.is_none() {
+            self.save(&Why { actor: "asqu".into(), ..Default::default() })?;
+        }
+        let cfg = config::load(self.root())?;
+        let head = self.head_manifest()?;
+        // The starting point's files, stored in batches so other saves never wait long.
+        let mut base = Manifest::new();
+        let mut batch: Vec<crate::worktree::BaseFile> = Vec::new();
+        let mut batch_bytes = 0usize;
+        const BATCH_BYTES: usize = 32 * 1024 * 1024;
+        let store_batch = |store: &Store, batch: &mut Vec<crate::worktree::BaseFile>, base: &mut Manifest| -> Result<()> {
+            let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate)?;
+            for f in batch.drain(..) {
+                let h = store.put_blob_near(&tx, &f.data, head.get(&f.path).map(|r| &r.hash))?;
+                // Windows keeps no "can be run" mark, so nothing there ever has one.
+                base.insert(f.path, FileRef { hash: h, exec: f.exec && cfg!(unix) });
+            }
+            tx.commit()?;
+            Ok(())
+        };
+        crate::worktree::read_commit(
+            top,
+            commit,
+            |rel, size| !cfg.too_big(rel, size) || head.contains_key(rel),
+            |mut f| {
+                // Git may store one kind of line ending and write the other into folders
+                // (its usual setting on Windows). The starting point is kept the way the
+                // main project has the file, and the Try's files are read the same way
+                // (see `snapshot_try`), so only real changes ever show on either side.
+                if let Some(main) = head.get(&f.path).and_then(|r| self.get_blob(&r.hash).ok()) {
+                    if crate::worktree::same_but_line_endings(&main, &f.data) {
+                        f.data = main;
+                    } else if let Some(converted) = crate::worktree::in_line_endings_of(&f.data, &main) {
+                        f.data = converted;
+                    }
+                }
+                batch_bytes += f.data.len();
+                batch.push(f);
+                if batch_bytes > BATCH_BYTES {
+                    batch_bytes = 0;
+                    store_batch(self, &mut batch, &mut base)?;
+                }
+                Ok(())
+            },
+        )?;
+        store_batch(self, &mut batch, &mut base)?;
+
+        let id = crate::worktree::identity(top).context("this folder is no longer a Git worktree of the project")?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // Another command may have linked it while the files were being read.
+        let linked: Option<String> =
+            tx.query_row("SELECT name FROM tries WHERE wt_id = ?1", [&id], |r| r.get(0)).optional()?;
+        if let Some(name) = linked {
+            tx.commit()?;
+            return Ok(name);
+        }
+        let wanted = crate::worktree::try_name_for(top);
+        let mut name = wanted.clone();
+        let mut n = 1;
+        while tx.query_row("SELECT 1 FROM tries WHERE name = ?1 COLLATE NOCASE", [&name], |_| Ok(())).optional()?.is_some() {
+            n += 1;
+            let tail = format!("-{n}");
+            name = format!("{}{tail}", &wanted[..wanted.len().min(40 - tail.len())]);
+        }
+        let mh = self.put_blob_near(&tx, &Store::encode_manifest(&base), None)?;
+        let base_seq: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM timeline", [], |r| r.get(0))?;
+        tx.execute(
+            "INSERT INTO tries (name, base_seq, created, status, request, manifest, path, base, wt_id)
+             VALUES (?1, ?2, ?3, 'open', '', ?4, ?5, ?4, ?6)",
+            params![name, base_seq, chrono::Utc::now().timestamp(), &mh[..], top.to_string_lossy(), id],
+        )?;
+        tx.commit()?;
+        Ok(name)
+    }
+
+    /// The person's current request, said inside a Try's folder: the Try's next saves are
+    /// labelled with it (until the Try is kept or the request is cleared), and it becomes
+    /// what a linked worktree's Try is for, if nothing was said before.
+    pub fn set_try_intent(&self, name: &str, request: &str) -> Result<()> {
+        let request = request.trim();
+        if request.is_empty() {
+            return Ok(());
+        }
+        valid_name(name)?;
+        self.set_meta(&format!("try_intent:{name}"), request)?;
+        self.conn.execute(
+            "UPDATE tries SET request = ?1 WHERE name = ?2 AND request = '' AND path IS NOT NULL",
+            params![request, name],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets the request set with `set_try_intent`.
+    pub fn clear_try_intent(&self, name: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM meta WHERE key = ?1", [format!("try_intent:{name}")])?;
+        Ok(())
+    }
+
+    /// Who reopened a Try the person had tossed, by working on in its folder (if that is
+    /// how it came back).
+    pub fn reopened_by(&self, name: &str) -> Option<String> {
+        self.meta(&format!("try_reopened:{name}")).ok().flatten()
+    }
+
+    /// A worktree that holds only part of the project (git left files out on purpose, or
+    /// has written none yet): those files would read as removed, so it is never combined.
+    fn refuse_partly_checked_out(&self, name: &str, row: &Row) -> Result<()> {
+        if let Some(path) = row.path.as_ref().filter(|_| self.folder_ok(row)) {
+            if crate::worktree::partly_checked_out(path) {
+                bail!(
+                    "Try \"{name}\" is a Git worktree that holds only part of the project (a sparse checkout), \
+                     so Asqu can't tell files that were removed from files that were never there. \
+                     Have Git fill in the whole project there (`git sparse-checkout disable` in {}) and try again.",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// What is in a Try's folder now. For a worktree, each file is read in the line-ending
+    /// style its starting point has: git may write a file into the worktree with Windows
+    /// line endings although the main project has it without (or the other way round),
+    /// and that alone is never a change.
+    fn snapshot_try(&self, conn: &rusqlite::Connection, row: &Row, dir: &Path, store: bool) -> Result<Manifest> {
+        let mut now = self.snapshot_dir(conn, dir, store)?;
+        if row.path.is_none() {
+            return Ok(now);
+        }
+        let base = self.base_of(row)?;
+        for (path, file) in now.iter_mut() {
+            let Some(start) = base.get(path).filter(|start| start.hash != file.hash) else { continue };
+            let (Ok(was), Ok(cur)) = (self.get_blob(&start.hash), fs::read(dir.join(path))) else { continue };
+            let Some(same_style) = crate::worktree::in_line_endings_of(&cur, &was) else { continue };
+            file.hash = if same_style == was {
+                start.hash
+            } else if store {
+                self.put_blob_near(conn, &same_style, Some(&start.hash))?
+            } else {
+                crate::hash::of(&same_style)
+            };
+        }
+        Ok(now)
+    }
+
+    /// The files in a Try's folder that differ from where it started, saved or not.
+    pub fn try_changes(&self, name: &str) -> Result<Changes> {
+        let row = self.try_row(name)?;
+        let dir = self.try_dir(name);
+        let now = if self.folder_ok(&row) && dir.is_dir() {
+            self.snapshot_try(&self.conn, &row, &dir, false)?
+        } else {
+            self.manifest_from_hash(&row.manifest)?
+        };
+        Ok(Store::diff(&self.base_of(&row)?, &now))
+    }
+
+    /// Why commands that change the main project are refused inside a Try's folder.
+    pub fn main_only_note(&self, name: &str) -> String {
+        let drop = if matches!(self.try_row(name), Ok(Row { path: Some(_), .. })) {
+            format!("To set this Try's work aside: `asqu try toss {name}` (the files in this folder stay as they are).")
+        } else {
+            format!("To drop this Try's work instead: `asqu try toss {name}`.")
+        };
+        format!(
+            "You're in the folder of Try \"{name}\". Undo and going back change the main project, so run them from its folder: {}\n{drop}",
+            self.root().display()
+        )
     }
 
     fn open_try(&self, name: &str) -> Result<Row> {
         let row = self.try_row(name)?;
         if row.status != "open" {
-            bail!("Try \"{name}\" was already {}", row.status);
+            bail!("Try \"{name}\" was already {} (see `asqu try list`)", row.status);
         }
         Ok(row)
     }
@@ -201,6 +546,9 @@ impl Store {
             "UPDATE tries SET status = 'tossed', closed = ?1 WHERE status = 'open'",
             params![chrono::Utc::now().timestamp()],
         )?;
+        // A worktree's folder named in a backup is never used: on this computer it may be
+        // someone else's folder, or nothing. Such a Try is brought back as an ordinary one.
+        self.conn.execute("UPDATE tries SET path = NULL, wt_id = NULL", [])?;
         // Replaces whatever list came in the backup: that list isn't signed either.
         self.set_meta(SET_ASIDE_META, &serde_json::to_string(&list("tossed")?)?)?;
         Ok(open)
@@ -241,7 +589,7 @@ impl Store {
         let manifest_hash = self.manifest_hash_at(base)?;
         let manifest = self.manifest_from_hash(&manifest_hash)?;
 
-        let dir = self.try_dir(name);
+        let dir = self.own_folder(name);
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
         }
@@ -257,20 +605,53 @@ impl Store {
     }
 
     /// Records what's in a Try's folder now. Returns what changed since its last save.
+    ///
+    /// A linked worktree whose folder is gone has nothing new to record: the Try stands as
+    /// it was last saved (a missing folder is never read as "every file was removed"). One
+    /// that was kept or tossed opens again when its folder has changed since.
     pub fn save_try(&mut self, name: &str, why: &Why) -> Result<Changes> {
+        let found = self.try_row(name)?;
+        if found.path.is_some() {
+            if !self.folder_ok(&found) {
+                return Ok(Changes::default());
+            }
+            if found.status != "open" {
+                // Only the person brings back a Try that came from a backup.
+                if self.try_is_set_aside(name)? {
+                    bail!("Try \"{name}\" was already {}", found.status);
+                }
+                let dir = self.try_dir(name);
+                let now = self.snapshot_try(&self.conn, &found, &dir, false)?;
+                if Store::diff(&self.manifest_from_hash(&found.manifest)?, &now).is_empty() {
+                    return Ok(Changes::default()); // nothing new there since it was closed
+                }
+                self.conn.execute(
+                    "UPDATE tries SET status = 'open', closed = NULL, kept_seq = NULL WHERE name = ?1",
+                    [name],
+                )?;
+                if found.status == "tossed" {
+                    // The person tossed it: say plainly that it is back, and why.
+                    self.set_meta(&format!("try_reopened:{name}"), &why.actor)?;
+                }
+            }
+        }
         let row = self.open_try(name)?;
         let dir = self.try_dir(name);
         let ts = chrono::Utc::now().timestamp();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let old = self.manifest_from_hash(&row.manifest)?;
-        let new = self.snapshot_dir(&tx, &dir, true)?;
+        let new = self.snapshot_try(&tx, &row, &dir, true)?;
         let changes = Store::diff(&old, &new);
         if changes.is_empty() {
             tx.commit()?;
             return Ok(changes);
         }
 
-        let request = if why.request.trim().is_empty() { row.request.clone() } else { why.request.clone() };
+        let request = if !why.request.trim().is_empty() {
+            why.request.clone()
+        } else {
+            self.meta(&format!("try_intent:{name}"))?.unwrap_or_else(|| row.request.clone())
+        };
         let summary = describe::summarize(&changes, self.line_totals(&old, &new, &changes)?);
         tx.execute(
             "INSERT INTO why (ts, request, actor, agent, session, summary) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -308,17 +689,21 @@ impl Store {
             .filter(|n| valid_name(n).is_ok())
             .map(|name| {
                 let row = self.try_row(&name)?;
-                let base = self.manifest_at(row.base_seq)?;
+                let base = self.base_of(&row)?;
                 // Open Tries: count what's in the folder right now, saved or not.
                 let dir = self.try_dir(&name);
-                let now = if row.status == "open" && dir.is_dir() {
-                    self.snapshot_dir(&self.conn, &dir, false)?
+                let there = self.folder_ok(&row);
+                let live = row.status == "open" || (row.path.is_some() && !self.try_is_set_aside(&name)?);
+                let now = if live && there && dir.is_dir() {
+                    self.snapshot_try(&self.conn, &row, &dir, false)?
                 } else {
                     self.manifest_from_hash(&row.manifest)?
                 };
                 Ok(TryInfo {
-                    path: self.try_dir(&name),
+                    path: dir,
                     changed: Store::diff(&base, &now).count(),
+                    worktree: row.path.is_some(),
+                    folder_gone: !there,
                     name,
                     base_seq: row.base_seq,
                     status: row.status,
@@ -329,13 +714,15 @@ impl Store {
     }
 
     /// Throws a Try away. Its edits stay in history (for a while) but its folder is removed.
+    /// A linked worktree's folder is left exactly as it is: it belongs to git.
     pub fn toss_try(&mut self, name: &str, actor: &str) -> Result<()> {
         self.save_try(name, &Why { actor: actor.into(), ..Default::default() })?;
+        self.open_try(name)?;
         self.conn.execute(
             "UPDATE tries SET status = 'tossed', closed = ?1 WHERE name = ?2",
             params![chrono::Utc::now().timestamp(), name],
         )?;
-        let _ = fs::remove_dir_all(self.try_dir(name));
+        self.remove_own_folder(name);
         Ok(())
     }
 
@@ -370,7 +757,19 @@ impl Store {
     }
 
     fn bring_back(&mut self, name: &str, manifest: &Hash) -> Result<PathBuf> {
-        let dir = self.try_dir(name);
+        let row = self.try_row(name)?;
+        if let Some(path) = &row.path {
+            // A worktree's folder is never rewritten: it is open again just as it stands.
+            if !self.folder_ok(&row) {
+                bail!(
+                    "Try \"{name}\" was a Git worktree at {}, and that folder is gone, so it can't be brought back",
+                    path.display()
+                );
+            }
+            self.conn.execute("UPDATE tries SET status = 'open', closed = NULL WHERE name = ?1", [name])?;
+            return Ok(path.clone());
+        }
+        let dir = self.own_folder(name);
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
         }
@@ -386,13 +785,20 @@ impl Store {
     /// changed in the main project meanwhile, applies the risk rule, runs the Check,
     /// then applies it and records a Timeline entry.
     pub fn keep_try(&mut self, name: &str, opts: KeepOptions, actor: &str) -> Result<KeepOutcome> {
-        let row = self.open_try(name)?;
         let who = Why { actor: actor.into(), ..Default::default() };
+        // More work in a worktree that was kept or tossed before opens its Try again.
+        if matches!(self.try_row(name), Ok(Row { path: Some(_), ref status, .. }) if status != "open") {
+            let _ = self.save_try(name, &who);
+        }
+        let row = self.open_try(name)?;
         self.save_try(name, &who)?;
         self.save(&who)?; // keep any unsaved work in the main project first
         let row = Row { manifest: self.try_row(name)?.manifest, ..row };
+        // A worktree whose folder is gone: kept from its last saved state.
+        let folder_there = self.folder_ok(&row);
+        self.refuse_partly_checked_out(name, &row)?;
 
-        let base = self.manifest_at(row.base_seq)?;
+        let base = self.base_of(&row)?;
         let ours = self.current_manifest()?;
         let theirs = self.manifest_from_hash(&row.manifest)?;
         for path in opts.take.keys() {
@@ -414,6 +820,10 @@ impl Store {
         // What exactly would be kept, and the check that would run: an approval given for
         // anything else doesn't count.
         let mut seen = Store::encode_manifest(&merged);
+        // And what it would replace: if the main project has changed since the person was
+        // shown the result, they are asked again.
+        seen.extend_from_slice(b"\0over:");
+        seen.extend_from_slice(&Store::encode_manifest(&ours));
         seen.extend_from_slice(b"\0check:");
         let check_cmd = cfg.check_command(cfg.clean);
         seen.extend_from_slice(check_cmd.as_deref().unwrap_or("").as_bytes());
@@ -427,7 +837,7 @@ impl Store {
         let risk = crate::decide::review_risk(risk::assess(&changes, lines, &cfg), &changes, &row.request);
         if changes.is_empty() {
             if Store::diff(&base, &theirs).is_empty() {
-                self.mark_kept(name, None)?; // it never changed anything
+                self.mark_kept(name, None, &theirs)?; // it never changed anything
             } else {
                 // Its changes were all set aside (the person chose the main project's version):
                 // closed as tossed, so it can still be brought back for a while.
@@ -435,7 +845,7 @@ impl Store {
                     "UPDATE tries SET status = 'tossed', closed = ?1 WHERE name = ?2",
                     params![chrono::Utc::now().timestamp(), name],
                 )?;
-                let _ = fs::remove_dir_all(self.try_dir(name));
+                self.remove_own_folder(name);
             }
             return Ok(KeepOutcome::Kept { seq: None, risk, changes, check: None, receipt: None });
         }
@@ -445,6 +855,9 @@ impl Store {
 
         let mut check = None;
         let mut checked = None;
+        // What Asqu knows the Try's folder holds: its saved files, or the combined result
+        // once that has been written there for the check.
+        let mut in_folder = &theirs;
         if let (Some(cmd), false) = (&check_cmd, opts.skip_check) {
             if !crate::trust::check_is_trusted(self.root(), cmd) {
                 if cmd.chars().any(describe::is_hidden) {
@@ -465,8 +878,11 @@ impl Store {
             // Check the combined result: inside the Try's folder, or (a clean check) in a
             // fresh copy holding only those files.
             let dir = self.try_dir(name);
-            self.apply(&dir, &Store::diff(&theirs, &merged), &merged)?;
-            let (result, files) = if cfg.clean {
+            if folder_there {
+                self.apply(&dir, &Store::diff(&theirs, &merged), &merged)?;
+                in_folder = &merged;
+            }
+            let (result, files) = if cfg.clean || !folder_there {
                 let (result, files) = self.run_check_clean(&merged, cmd)?;
                 (result, Some(files))
             } else {
@@ -490,23 +906,103 @@ impl Store {
             ..Default::default()
         })?;
         let seq = saved.map(|r| r.seq);
-        self.mark_kept(name, seq)?;
+        self.mark_kept(name, seq, in_folder)?;
         // The check passed on exactly these files: sign a receipt saying so.
         let receipt = match (&check_cmd, checked) {
-            (Some(cmd), Some(files)) => crate::receipt::issue(&root, files, cmd, cfg.clean).ok(),
+            (Some(cmd), Some(files)) => crate::receipt::issue(&root, files, cmd, cfg.clean || !folder_there).ok(),
             _ => None,
         };
         Ok(KeepOutcome::Kept { seq, risk, changes, check, receipt })
     }
 
-    fn mark_kept(&mut self, name: &str, seq: Option<i64>) -> Result<()> {
+    /// `in_folder`: the files Asqu last saw or wrote in the Try's folder, all of them now
+    /// kept. Never a fresh look at the folder: anything written there while the keep was
+    /// going on (by a slow check, or an AI still working) hasn't been kept, and must still
+    /// show as new work.
+    fn mark_kept(&mut self, name: &str, seq: Option<i64>, in_folder: &Manifest) -> Result<()> {
+        let row = self.try_row(name)?;
+        let _ = self.conn.execute("DELETE FROM meta WHERE key IN (?1, ?2)", params![format!("try_intent:{name}"), format!("try_reopened:{name}")]);
         self.conn
             .execute(
                 "UPDATE tries SET status = 'kept', kept_seq = ?1, closed = ?2 WHERE name = ?3",
                 params![seq, chrono::Utc::now().timestamp(), name],
             )?;
-        let _ = fs::remove_dir_all(self.try_dir(name));
+        if row.path.is_some() {
+            // The worktree stays. What was kept is where any further work there starts
+            // from (the Try opens again when the folder holds something else).
+            let mh = self.put_blob_near(&self.conn, &Store::encode_manifest(in_folder), Some(&row.manifest))?;
+            self.conn.execute(
+                "UPDATE tries SET manifest = ?1, base = ?1, base_seq = COALESCE(?2, base_seq) WHERE name = ?3",
+                params![&mh[..], self.head_seq()?, name],
+            )?;
+        } else {
+            self.remove_own_folder(name);
+        }
         Ok(())
+    }
+
+    /// Brings a Try up to date: what changed in the main project since the Try started is
+    /// combined into the Try's folder, and the Try then starts from the main project as it
+    /// is now. The main project is not changed. If both sides changed the same lines,
+    /// nothing is changed and the clashes are returned; `take` chooses a side per file.
+    /// The Try is saved first, so whatever is replaced can still be found in its history.
+    pub fn update_try(
+        &mut self,
+        name: &str,
+        take: &BTreeMap<String, Side>,
+        dry_run: bool,
+        actor: &str,
+    ) -> Result<UpdateOutcome> {
+        let who = Why { actor: actor.into(), ..Default::default() };
+        if matches!(self.try_row(name), Ok(Row { path: Some(_), ref status, .. }) if status != "open") {
+            let _ = self.save_try(name, &who);
+        }
+        let row = self.open_try(name)?;
+        if !self.folder_ok(&row) {
+            bail!(
+                "Try \"{name}\" is a Git worktree whose folder is gone ({}), so there is nothing to bring up to date.\n\
+                 Asqu still has its work as last saved: keep that with `asqu try keep {name}`, or drop it with `asqu try toss {name}`.",
+                self.try_dir(name).display()
+            );
+        }
+        self.refuse_partly_checked_out(name, &row)?;
+        self.save_try(name, &who)?;
+        self.save(&who)?; // the main project exactly as it is now
+        let row = self.try_row(name)?;
+        let base = self.base_of(&row)?;
+        let ours = self.current_manifest()?;
+        let theirs = self.manifest_from_hash(&row.manifest)?;
+        for path in take.keys() {
+            if !base.contains_key(path) && !ours.contains_key(path) && !theirs.contains_key(path) {
+                bail!("\"{path}\" isn't a file in this Try or the main project; use the file names exactly as listed");
+            }
+        }
+        let (merged, clashes) = self.combine(&base, &ours, &theirs, false, take)?;
+        if !clashes.is_empty() {
+            let questions = clashes
+                .iter()
+                .map(|p| self.explain_clash(p, &base, &ours, &theirs))
+                .collect::<Result<_>>()?;
+            return Ok(UpdateOutcome::Clash { files: clashes, questions });
+        }
+        let changes = Store::diff(&theirs, &merged);
+        let head = self.head_seq()?;
+        let already = changes.is_empty() && Store::diff(&base, &ours).is_empty();
+        if already {
+            return Ok(UpdateOutcome::UpToDate);
+        }
+        if dry_run {
+            return Ok(UpdateOutcome::Updated { changes, dry_run: true });
+        }
+        let dir = self.try_dir(name);
+        self.apply(&dir, &changes, &merged)?;
+        // From here on the Try starts from the main project as it is now.
+        self.conn.execute(
+            "UPDATE tries SET base_seq = COALESCE(?1, base_seq), base = NULL WHERE name = ?2",
+            params![head, name],
+        )?;
+        self.save_try(name, &Why { request: "Brought up to date with the main project".into(), actor: actor.into(), ..Default::default() })?;
+        Ok(UpdateOutcome::Updated { changes, dry_run: false })
     }
 
     /// Three-way combine: `base` is where the Try started, `ours` the main project now,

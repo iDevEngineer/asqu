@@ -173,7 +173,8 @@ fn make_format_5(root: &Path) {
         .execute_batch(
             "ALTER TABLE blobs DROP COLUMN enc; ALTER TABLE blobs DROP COLUMN base;
              ALTER TABLE blobs DROP COLUMN depth; ALTER TABLE blobs DROP COLUMN ts; ALTER TABLE blobs DROP COLUMN checked;
-             ALTER TABLE tries DROP COLUMN closed; PRAGMA user_version = 5;",
+             ALTER TABLE tries DROP COLUMN closed; ALTER TABLE tries DROP COLUMN path;
+             ALTER TABLE tries DROP COLUMN base; ALTER TABLE tries DROP COLUMN wt_id; PRAGMA user_version = 5;",
         )
         .unwrap();
 }

@@ -56,12 +56,18 @@ what the person asked you, so please tell it:
    `asqu intent \"<the person's request>\"`
 2. **When you've finished**, run `asqu save`.
 
-If you can't run commands, write the request to `.asqu/intent` before editing instead.
+If you can't run commands, write the request to `.asqu/intent` before editing instead (this
+labels the main project's changes only: in a Git worktree, use `asqu intent`).
 
 - To undo or go back: preview with `asqu undo --dry-run` or `asqu back <their words> --dry-run`,
   show the person, then run it without `--dry-run`.
 - For a big or risky change, use a Try: `asqu try start <name> -w \"<request>\"`, work in the
   folder it prints, then `asqu try keep <name>`.
+- Working in a Git worktree? Asqu records it as a Try of the main project, named after its
+  folder: `asqu status` there says \"This folder is Try ...\". Don't start another Try. Save as
+  usual; `asqu try keep` there combines the work into the main project, and `asqu try update`
+  brings in what changed in the main project meanwhile. Undo and going back only work from
+  the main project's folder.
 - Never pass `--yes` or `--trust-check` yourself. Those are the person's decisions.
 <!-- asqu:end -->
 ";
