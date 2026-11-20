@@ -187,6 +187,13 @@ impl Store {
             hide_from_git(&root);
         }
         let conn = Connection::open(dir.join("store.db"))?;
+        // A history from elsewhere (a backup, a downloaded project) is untrusted until it is
+        // checked. Asqu never writes database code that runs by itself (triggers, views), so
+        // a history holding any was made or changed by something else: such code could alter
+        // rows after `verify` has passed them. It is refused before anything else runs.
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        refuse_planted_schema(&conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
@@ -1366,6 +1373,22 @@ fn safe_join(dir: &Path, rel: &str) -> Result<PathBuf> {
 /// Is this name `.git` or `.asqu` as far as the file system is concerned? Mac and Windows
 /// ignore case; Windows also ignores trailing dots and spaces, reads `name:stream` as
 /// `name`, and has short "8.3" names (`GIT~1`); Mac ignores some invisible characters.
+/// Refuses a history file holding triggers or views: Asqu never makes them, so they were
+/// planted, and they could change what was checked after the check.
+fn refuse_planted_schema(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') ORDER BY name")?;
+    let planted: Vec<String> = stmt
+        .query_map([], |r| Ok(format!("{} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !planted.is_empty() {
+        bail!(
+            "this history holds database code that Asqu never writes ({}), so it may have been tampered with and wasn't opened",
+            describe::printable(&planted.join(", "))
+        );
+    }
+    Ok(())
+}
+
 pub fn is_reserved_name(name: &str) -> bool {
     let visible: String = name
         .chars()

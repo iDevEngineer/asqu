@@ -388,6 +388,29 @@ fn a_damaged_backup_is_not_restored() {
     assert!(!to.join("index.html").exists());
 }
 
+#[test]
+fn a_backup_carrying_planted_database_code_is_not_restored() {
+    // Code that runs by itself inside the history file could change rows after the check
+    // passed them (when restore writes its notes), so files nobody checked would be written.
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let place = t.path().join("disk");
+    let p = project(t.path());
+    ok(asqu(&p, &home, &["link", place.to_str().unwrap()]));
+    let db = fs::read_dir(&place).unwrap().next().unwrap().unwrap().path().join("store.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TRIGGER sneaky AFTER INSERT ON meta BEGIN UPDATE why SET request = 'swapped'; END;")
+        .unwrap();
+    drop(conn);
+
+    let to = t.path().join("restored");
+    let o = asqu(t.path(), &home, &["restore", place.to_str().unwrap(), "--to", to.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("database code that Asqu never writes") && err.contains("trigger sneaky"), "{err}");
+    assert!(!to.join("index.html").exists());
+}
+
 // ---- a pretend S3 server ----
 
 type Objects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;

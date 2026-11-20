@@ -96,11 +96,28 @@ fn covered_files(dir: &Path) -> Result<(Vec<(String, std::path::PathBuf)>, Vec<S
                 note("downloaded packages");
                 return false;
             }
+            // Only the project's own `.git` and `.asqu` at the top are left out quietly. A
+            // look-alike reserved name (`.git.`, `git~1`), or one deeper down, is left out but
+            // reported, so a receipt that must cover everything is refused.
             let reserved = crate::store::is_reserved_name(&name);
-            if reserved && e.depth() > 1 {
-                note("a reserved name");
+            if reserved {
+                // Exactly these names: on a case-sensitive disk `.GIT` is a different folder.
+                let own = e.depth() == 1 && (name == ".git" || name == ".asqu");
+                if !own {
+                    note("a reserved name");
+                }
+                return false;
             }
-            !(reserved || crate::scan::ALWAYS_SKIP.iter().any(|s| s.eq_ignore_ascii_case(&name)))
+            // Finder's `.DS_Store` files are left out (Finder rewrites them all the time).
+            // Anything else with that name (a folder, a link) could hold project files, so
+            // it is reported.
+            if name.eq_ignore_ascii_case(".DS_Store") {
+                if !e.file_type().is_some_and(|t| t.is_file()) {
+                    note("not a Finder file, despite its name");
+                }
+                return false;
+            }
+            !crate::scan::ALWAYS_SKIP.iter().any(|s| s.eq_ignore_ascii_case(&name))
         });
     let rel_of = |abs: &Path| -> Result<String> {
         Ok(abs
