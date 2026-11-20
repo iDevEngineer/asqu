@@ -250,6 +250,9 @@ fn a_history_once_started_in_the_home_folder_is_no_longer_used() {
     // There, Asqu says what happened and how to remove it, and changes nothing.
     let (ok, out) = asqu_at_home(&home, &home, &["status"], None);
     assert!(!ok && out.contains("by mistake") && out.contains("asqu remove"), "{out}");
+    // In a folder it used to cover, it is said to be there, not hidden.
+    let (ok, out) = asqu_at_home(&project, &home, &["status"], None);
+    assert!(ok && out.contains("No history here yet") && out.contains("no longer") && out.contains("asqu remove"), "{out}");
     // A project below it gets a history of its own instead of being recorded into it.
     let (ok, out) = asqu_at_home(&project, &home, &["save", "-w", "Start"], None);
     assert!(ok && out.contains("1 added"), "{out}");
@@ -295,18 +298,21 @@ fn looking_never_starts_a_history() {
     let (home, settings, dir) = (t.path().join("home"), t.path().join("settings"), t.path().join("somewhere"));
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("a.txt"), "one").unwrap();
-    for args in [&["status"][..], &["log"], &["summary"], &["verify"], &["try", "list"], &["tidy"], &["show", "1"], &["link"]] {
+    for args in [&["status"][..], &["log"], &["summary"], &["try", "list"], &["try", "compare"], &["tidy"], &["show", "1"], &["link"], &["intent"], &["receipt"]] {
         let (ok, out) = asqu_as(&dir, &home, &settings, false, args);
         assert!(ok && out.contains("No history here yet"), "{args:?}: {out}");
     }
     // Asked to change something there is nothing of: said plainly, as a failure.
-    for args in [&["undo"][..], &["back", "#1"], &["mark", "v1"]] {
+    // (`verify` among them: nothing to check is never "the history is intact".)
+    for args in [&["undo"][..], &["back", "#1"], &["mark", "v1"], &["verify"]] {
         let (ok, out) = asqu_as(&dir, &home, &settings, false, args);
         assert!(!ok && out.contains("No history here yet"), "{args:?}: {out}");
     }
     // The same for an AI tool that only looks.
     let (ok, out) = asqu_as(&dir, &home, &settings, false, &["call", "asqu_status", "{}"]);
     assert!(ok && out.contains("\"history\": false"), "{out}");
+    let (ok, out) = asqu_as(&dir, &home, &settings, false, &["call", "asqu_summary", "{}"]);
+    assert!(ok && out.contains("No history here yet"), "{out}");
     let (ok, out) = asqu_as(&dir, &home, &settings, false, &["call", "asqu_log", "{}"]);
     assert!(ok && out.trim() == "[]", "{out}");
     // The tool list needs no project at all.
@@ -375,4 +381,34 @@ fn remove_in_the_home_folder_keeps_asqus_own_keys_and_settings() {
     let kept: Vec<_> = fs::read_dir(settings.join("removed")).unwrap().map(|e| e.unwrap().path()).collect();
     assert!(kept.len() == 1 && kept[0].join("store.db").is_file());
     assert_eq!(fs::read_to_string(home.join("notes.txt")).unwrap(), "mine");
+}
+
+#[test]
+fn histories_moved_aside_never_land_on_each_other() {
+    let t = tempfile::tempdir().unwrap();
+    let (home, settings) = (t.path().join("home"), t.path().join("settings"));
+    // Several projects whose folders share a name, removed one straight after another
+    // (within the same second, which is all the moved folder's name tells apart).
+    let projects: Vec<_> = (0..5).map(|i| t.path().join(format!("p{i}")).join("app")).collect();
+    for (i, dir) in projects.iter().enumerate() {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("a.txt"), format!("project {i}")).unwrap();
+        assert!(asqu_as(dir, &home, &settings, false, &["save", "-w", &format!("project {i}")]).0);
+    }
+    for dir in &projects {
+        let (ok, out) = asqu_as(dir, &home, &settings, true, &["remove"]);
+        assert!(ok && out.contains("Done."), "{out}");
+    }
+    let kept: Vec<_> = fs::read_dir(settings.join("removed")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(kept.len(), 5, "each history has a place of its own: {kept:?}");
+    // And each is still the history it was: moved back, it shows its own entry.
+    for (i, dir) in projects.iter().enumerate() {
+        let mine = kept.iter().find(|k| {
+            fs::rename(k, dir.join(".asqu")).unwrap();
+            let found = asqu_as(dir, &home, &settings, false, &["log"]).1.contains(&format!("project {i}"));
+            fs::rename(dir.join(".asqu"), k).unwrap();
+            found
+        });
+        assert!(mine.is_some(), "project {i}'s history survived");
+    }
 }

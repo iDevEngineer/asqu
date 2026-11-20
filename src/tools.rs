@@ -244,6 +244,10 @@ pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str
                     "note": "No history here yet, so nothing is recorded. The first asqu_save starts one." }))
             }
             "asqu_log" | "asqu_try_list" => return Ok(json!([])),
+            "asqu_summary" => {
+                return Ok(json!({ "summary": "No history here yet.", "changes": 0, "undos": 0,
+                    "tries_kept": 0, "tries_tossed": 0, "tries_open": 0, "by": {}, "history": false }))
+            }
             _ => {}
         }
     }

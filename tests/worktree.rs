@@ -936,7 +936,8 @@ fn a_worktree_whose_files_git_wrote_with_other_line_endings_shows_only_real_chan
     assert!(fs::read(wt.join("other.txt")).unwrap().contains(&b'\r'), "git wrote Windows line endings");
     assert!(!fs::read(main.join("other.txt")).unwrap().contains(&b'\r'));
     // Nothing edited yet: nothing shows as changed, on either side.
-    assert!(run(&wt, &home, ASQU, &["status"]).contains("No changes") || !run(&wt, &home, ASQU, &["status"]).contains("other.txt"));
+    let (_, untouched) = call(&wt, &home, "asqu_status", "{}");
+    assert_eq!((untouched["added"].to_string(), untouched["modified"].to_string(), untouched["deleted"].to_string()), ("[]".into(), "[]".into(), "[]".into()), "{untouched}");
     let (_, plan) = call(&main, &home, "asqu_try_update", r#"{"name":"crlf","dry_run":true}"#);
     assert_eq!(plan["status"], "up_to_date", "{plan}");
     // One real edit on each side, in different files.
@@ -950,4 +951,30 @@ fn a_worktree_whose_files_git_wrote_with_other_line_endings_shows_only_real_chan
     // The main project gets the edit, in its own line endings, and keeps its own edit.
     assert_eq!(fs::read_to_string(main.join("app.txt")).unwrap(), "one\ntwo\nthree (try)\n");
     assert_eq!(fs::read_to_string(main.join("other.txt")).unwrap(), "other (main)\n");
+}
+
+#[test]
+fn files_that_mix_line_endings_show_only_real_changes() {
+    let (_t, home, main) = project();
+    run(&main, &home, "git", &["config", "core.autocrlf", "true"]);
+    fs::write(main.join("lines.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    fs::write(main.join("mixed.txt"), "one\ntwo\n").unwrap();
+    run(&main, &home, "git", &["add", "."]);
+    run(&main, &home, "git", &["commit", "-qm", "files"]);
+    // The main project has one file with both kinds of line ending in it.
+    fs::write(main.join("mixed.txt"), "one\r\ntwo\n").unwrap();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "mixing");
+    // An AI tool adds a plain line to a file git wrote with Windows line endings...
+    assert!(fs::read(wt.join("lines.txt")).unwrap().contains(&b'\r'));
+    fs::write(wt.join("lines.txt"), "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix (try)\n").unwrap();
+    // ...while the main project edits another line of it.
+    fs::write(main.join("lines.txt"), "one (main)\ntwo\nthree\nfour\nfive\n").unwrap();
+    run(&main, &home, ASQU, &["save", "-w", "Main edit"]);
+    let saved = run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
+    assert!(saved.contains("lines.txt") && !saved.contains("mixed.txt"), "an untouched mixed file is not a change: {saved}");
+    let kept = run(&main, &home, ASQU, &["try", "keep", "mixing", "--no-check"]);
+    assert!(kept.contains("Kept Try"), "{kept}");
+    assert_eq!(fs::read_to_string(main.join("lines.txt")).unwrap(), "one (main)\ntwo\nthree\nfour\nfive\nsix (try)\n");
+    assert_eq!(fs::read_to_string(main.join("mixed.txt")).unwrap(), "one\r\ntwo\n", "the main project's own file is left as it is");
 }
