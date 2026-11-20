@@ -203,6 +203,16 @@ impl Store {
         Self::open_at(&root)
     }
 
+    /// A history in a folder above `start` that is no longer used because that folder is
+    /// far too wide to be a project (see `not_a_project`).
+    pub fn unused_history_above(start: &Path) -> Option<PathBuf> {
+        start
+            .ancestors()
+            .skip(1)
+            .find(|dir| dir.join(DIR).join("store.db").is_file() && too_wide(dir))
+            .map(Path::to_path_buf)
+    }
+
     /// Why Asqu won't keep a history in this folder, when it is far too wide to be one
     /// project: the person's home folder, or a folder that holds it (up to the top of the
     /// drive). Running any command there would otherwise record everything on the
@@ -818,12 +828,15 @@ impl Store {
     /// saved and the file cache is updated; files whose size and modified time match the
     /// cache are not re-read.
     fn snapshot(&self, conn: &Connection, store: bool) -> Result<Manifest> {
-        self.snapshot_dir(conn, &self.root.clone(), store)
+        self.snapshot_dir(conn, &self.root.clone(), store, None)
     }
 
     /// Like `snapshot`, for any folder (a Try's workspace uses this). The file cache is
     /// only used for the project folder itself.
-    pub(crate) fn snapshot_dir(&self, conn: &Connection, dir: &Path, store: bool) -> Result<Manifest> {
+    ///
+    /// `last_saved`: what this folder held when it was last recorded, used for a file that
+    /// can't be read just now. `None`: the project's latest Timeline entry.
+    pub(crate) fn snapshot_dir(&self, conn: &Connection, dir: &Path, store: bool, last_saved: Option<&Manifest>) -> Result<Manifest> {
         refuse_linked_folder(dir)?; // never read files from elsewhere into the history
         let use_cache = dir == self.root;
         let now_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as i64;
@@ -881,10 +894,10 @@ impl Store {
                                 eprintln!(
                                     "asqu: couldn't read {}: another program has it locked. {}",
                                     crate::describe::printable(&rel),
-                                    if head.contains_key(&rel) { "It stays as last saved." } else { "It isn't recorded this time." }
+                                    if last_saved.unwrap_or(&head).contains_key(&rel) { "It stays as last saved." } else { "It isn't recorded this time." }
                                 );
                             }
-                            if let Some(last) = head.get(&rel) {
+                            if let Some(last) = last_saved.unwrap_or(&head).get(&rel) {
                                 m.insert(rel, *last);
                             }
                             continue;

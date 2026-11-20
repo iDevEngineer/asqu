@@ -478,14 +478,26 @@ impl Store {
     /// line endings although the main project has it without (or the other way round),
     /// and that alone is never a change.
     fn snapshot_try(&self, conn: &rusqlite::Connection, row: &Row, dir: &Path, store: bool) -> Result<Manifest> {
-        let mut now = self.snapshot_dir(conn, dir, store)?;
+        // A file that can't be read just now stays as this Try last had it.
+        let last_saved = self.manifest_from_hash(&row.manifest)?;
+        let mut now = self.snapshot_dir(conn, dir, store, Some(&last_saved))?;
         if row.path.is_none() {
             return Ok(now);
         }
         let base = self.base_of(row)?;
         for (path, file) in now.iter_mut() {
             let Some(start) = base.get(path).filter(|start| start.hash != file.hash) else { continue };
-            let (Ok(was), Ok(cur)) = (self.get_blob(&start.hash), fs::read(dir.join(path))) else { continue };
+            // Still an ordinary file (never a link put there since the scan).
+            let here = dir.join(path);
+            if !fs::symlink_metadata(&here).is_ok_and(|m| m.is_file()) {
+                continue;
+            }
+            let (Ok(was), Ok(cur)) = (self.get_blob(&start.hash), fs::read(&here)) else { continue };
+            // The same text whatever the line endings (also where one of them mixes the two).
+            if crate::worktree::same_but_line_endings(&cur, &was) {
+                file.hash = start.hash;
+                continue;
+            }
             let Some(same_style) = crate::worktree::in_line_endings_of(&cur, &was) else { continue };
             file.hash = if same_style == was {
                 start.hash

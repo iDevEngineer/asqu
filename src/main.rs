@@ -473,7 +473,21 @@ fn remove_command(dry_run: bool) -> Result<()> {
     };
     let (entries, tries) = (count("SELECT COUNT(*) FROM timeline"), count("SELECT COUNT(*) FROM tries WHERE status = 'open'"));
     let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
-    let dest = home.join("removed").join(format!("{name}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    // A place nothing is in yet: one moved history must never land on another.
+    let stamp = format!("{name}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let mut dest = home.join("removed").join(&stamp);
+    let mut n = 1;
+    while std::fs::symlink_metadata(&dest).is_ok() {
+        n += 1;
+        dest = home.join("removed").join(format!("{stamp}-{n}"));
+    }
+    if !shared && dest.starts_with(&dir) {
+        anyhow::bail!(
+            "Your own Asqu folder ({}) is inside this project's history, so the history can't be moved there. \
+             Set ASQU_HOME to a folder outside the project and run this again.",
+            home.display()
+        );
+    }
 
     println!("Asqu's history for {}:", root.display());
     println!("  {entries} Timeline entr{}, {tries} open Tr{}.", if entries == 1 { "y" } else { "ies" }, if tries == 1 { "y" } else { "ies" });
@@ -482,6 +496,7 @@ fn remove_command(dry_run: bool) -> Result<()> {
     println!("  - takes Asqu's notes and hooks for AI tools out of this folder");
     println!("  - leaves your own files exactly as they are, and any backups where they are");
     println!("After that, Asqu can undo nothing here. To bring the history back, move that folder back to {}.", dir.display());
+    println!("If `asqu watch` or the Asqu view is running for this folder, stop it first.");
     if dry_run {
         println!("Nothing was changed.");
         return Ok(());
@@ -503,8 +518,10 @@ fn remove_command(dry_run: bool) -> Result<()> {
     if let Ok(conn) = rusqlite::Connection::open(dir.join("store.db")) {
         let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
     }
+    std::fs::create_dir_all(dest.parent().context("no folder to move the history to")?)?;
     if shared {
-        std::fs::create_dir_all(&dest)?;
+        // Fails if something took the name meanwhile: nothing is ever merged into it.
+        std::fs::create_dir(&dest).with_context(|| format!("making {}", dest.display()))?;
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let file = entry.file_name().to_string_lossy().into_owned();
@@ -513,8 +530,17 @@ fn remove_command(dry_run: bool) -> Result<()> {
             }
         }
     } else {
-        std::fs::create_dir_all(dest.parent().context("no folder to move the history to")?)?;
-        move_aside(&dir, &dest)?;
+        // First out of use, in one step, under a name Asqu never scans: from here on the
+        // project has no history, whole or partial, and a failure can put it straight back.
+        let staged = root.join("asqu~removing");
+        if std::fs::symlink_metadata(&staged).is_ok() {
+            anyhow::bail!("{} is left over from an earlier try; move it away first. Nothing was changed.", staged.display());
+        }
+        std::fs::rename(&dir, &staged).with_context(|| format!("another program is using {}; nothing was changed", dir.display()))?;
+        if let Err(e) = move_aside(&staged, &dest) {
+            let _ = std::fs::rename(&staged, &dir);
+            return Err(e.context("the history could not be moved, so it was left where it was"));
+        }
     }
     println!("Done. Asqu's history for this folder is now in {}.", dest.display());
     Ok(())
@@ -523,6 +549,10 @@ fn remove_command(dry_run: bool) -> Result<()> {
 /// Moves a file or folder, also to another disk (where it is copied, then the original
 /// removed). Links are never followed.
 fn move_aside(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    // Never onto something that is already there.
+    if std::fs::symlink_metadata(to).is_ok() {
+        anyhow::bail!("{} is already there; nothing was moved", to.display());
+    }
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
@@ -540,10 +570,10 @@ fn move_aside(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
         Ok(())
     }
     copy(from, to).with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
-    if std::fs::symlink_metadata(from)?.is_dir() {
-        std::fs::remove_dir_all(from)?;
-    } else {
-        std::fs::remove_file(from)?;
+    // The whole of it is in the new place now. A leftover of the old one is only clutter.
+    let gone = if std::fs::symlink_metadata(from)?.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) };
+    if gone.is_err() {
+        eprintln!("asqu: {} is copied to its new place, but the old copy couldn't be deleted. You can delete it yourself.", from.display());
     }
     Ok(())
 }
@@ -1429,11 +1459,13 @@ fn main() -> Result<()> {
                 | Command::Tidy { .. }
                 | Command::Backup { .. }
                 | Command::Link { place: None, .. }
-                | Command::Try { cmd: TryCmd::List }
+                | Command::Intent { request: None, clear: false }
+                | Command::Receipt { save: false }
+                | Command::Try { cmd: TryCmd::List | TryCmd::Compare { .. } }
         );
         // An AI tool that only looks gets its answer without a history being made.
         if let Command::Call { tool, args } = &cli.command {
-            if matches!(tool.as_str(), "asqu_status" | "asqu_log" | "asqu_try_list") {
+            if matches!(tool.as_str(), "asqu_status" | "asqu_log" | "asqu_try_list" | "asqu_summary") {
                 let _ = args;
                 let answer = asqu::tools::call(&cwd, tool, &serde_json::json!({}), &actor())?;
                 println!("{}", serde_json::to_string_pretty(&answer)?);
@@ -1445,12 +1477,22 @@ fn main() -> Result<()> {
             if let Some(why) = Store::not_a_project(top) {
                 anyhow::bail!("{why}");
             }
-            const NONE_YET: &str = "No history here yet. Asqu starts one by itself the first time something is saved \
-                                    here (`asqu save`, or an AI tool's first edit).";
-            if asks_for_change {
-                anyhow::bail!("{NONE_YET}");
+            let mut none_yet = "No history here yet. Asqu starts one by itself the first time something is saved \
+                                here (`asqu save`, or an AI tool's first edit)."
+                .to_string();
+            // A history that used to cover this folder from far above is said, not hidden.
+            if let Some(above) = Store::unused_history_above(&cwd) {
+                none_yet.push_str(&format!(
+                    "\nAn earlier version of Asqu kept a history for all of {} (this folder included). It is no longer \
+                     used. It is still there: run `asqu remove` in that folder to move it aside.",
+                    above.display()
+                ));
             }
-            println!("{NONE_YET}");
+            // Nothing to check is not "the history is intact": a script must not read it so.
+            if asks_for_change || matches!(cli.command, Command::Verify { .. }) {
+                anyhow::bail!("{none_yet}");
+            }
+            println!("{none_yet}");
             return Ok(());
         }
     }

@@ -526,20 +526,34 @@ pub fn with_line_endings_of(data: &[u8], like: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `data` written with the kind of line ending `like` has, when each of the two uses one
-/// kind throughout and they differ. `None` when there is nothing to convert (the same
-/// kind already, mixed line endings, or not text).
+/// `data` with every line ending written the way `like` writes them, when `like` uses one
+/// kind throughout (`data` may mix the two: an AI tool adding plain lines to a file git
+/// wrote with Windows line endings does). `None` when there is nothing to convert:
+/// `like` mixes them itself or has no line endings, `data` is already that way, or it
+/// isn't text.
 pub fn in_line_endings_of(data: &[u8], like: &[u8]) -> Option<Vec<u8>> {
-    if let Some(windows) = with_line_endings_of(data, like) {
-        return Some(windows);
-    }
-    let windows_throughout =
-        data.contains(&b'\n') && data.iter().enumerate().all(|(i, c)| *c != b'\n' || (i > 0 && data[i - 1] == b'\r'));
-    if !windows_throughout || !like.contains(&b'\n') || like.contains(&b'\r') || data.contains(&0) {
+    if !like.contains(&b'\n') || data.contains(&0) {
         return None;
     }
-    // Drop the `\r` of each `\r\n`.
-    Some(data.iter().enumerate().filter(|(i, c)| !(**c == b'\r' && data.get(i + 1) == Some(&b'\n'))).map(|(_, c)| *c).collect())
+    let windows = like.iter().enumerate().all(|(i, c)| *c != b'\n' || (i > 0 && like[i - 1] == b'\r'));
+    if !windows && like.contains(&b'\r') {
+        return None; // mixed, or old-style: left as it is
+    }
+    let mut out = Vec::with_capacity(data.len() + data.len() / 16);
+    for (i, c) in data.iter().enumerate() {
+        match *c {
+            // The `\r` of a `\r\n` is written (or not) with its `\n`. A lone `\r` stays.
+            b'\r' if data.get(i + 1) == Some(&b'\n') => {}
+            b'\n' => {
+                if windows {
+                    out.push(b'\r');
+                }
+                out.push(b'\n');
+            }
+            other => out.push(other),
+        }
+    }
+    (out != data).then_some(out)
 }
 
 /// The same text apart from line endings? Git can store a file with one kind of line
@@ -641,7 +655,10 @@ mod tests {
         assert_eq!(in_line_endings_of(b"a\r\nb\r\n", b"x\ny\n").as_deref(), Some(&b"a\nb\n"[..]));
         assert_eq!(in_line_endings_of(b"a\nb\n", b"x\r\ny\r\n").as_deref(), Some(&b"a\r\nb\r\n"[..]));
         assert_eq!(in_line_endings_of(b"a\nb\n", b"x\ny\n"), None, "the same kind already");
-        assert_eq!(in_line_endings_of(b"a\r\nb\n", b"x\ny\n"), None, "mixed is left alone");
+        assert_eq!(in_line_endings_of(b"a\r\nb\n", b"x\ny\n").as_deref(), Some(&b"a\nb\n"[..]), "mixed is made one kind");
+        assert_eq!(in_line_endings_of(b"a\nb\r\n", b"x\r\ny\r\n").as_deref(), Some(&b"a\r\nb\r\n"[..]));
+        assert_eq!(in_line_endings_of(b"a\nb\n", b"x\r\ny\n"), None, "nothing to follow when the other is mixed");
+        assert_eq!(in_line_endings_of(b"a\rb\r\n", b"x\n").as_deref(), Some(&b"a\rb\n"[..]), "a lone \\r stays");
         assert_eq!(in_line_endings_of(b"a\r\n\0", b"x\n"), None, "not text");
         assert!(same_but_line_endings(b"a\n", b"a\n"));
         assert!(!same_but_line_endings(b"a\nb\n", b"a\nc\n"));
