@@ -32,18 +32,53 @@ fn read_pointer(path: &Path) -> Option<String> {
     Some(fs::read_to_string(path).ok()?.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Does this path name a place on another computer (`\\\\server\\share`, `//server/share`, and
-/// the longer Windows ways of writing the same)? Only a drive on this computer written
-/// the long way (`\\\\?\\C:\\…`) starts like that and is local.
+/// Is this path written in a way that can only mean a place on this computer? Anything
+/// else is refused rather than recognised: Windows has many ways of writing "another
+/// computer" or "a device" (`\\\\server\\share`, `//server/share`, `\\\\?\\UNC\\…`, `\\\\.\\…`,
+/// `\\??\\…`), and only looking at such a place contacts it. Accepted: a path relative to
+/// where the pointer is, a drive (`C:\\…`, also written `\\\\?\\C:\\…`), or a path from the
+/// top of this computer's files (`/home/…`).
 fn names_another_computer(path: &str) -> bool {
     let sep = |c: char| c == '/' || c == '\\';
-    let mut chars = path.chars();
-    if !(chars.next().is_some_and(sep) && chars.next().is_some_and(sep)) {
-        return false;
+    let c: Vec<char> = path.chars().collect();
+    let drive = |at: usize| c.len() > at + 2 && c[at].is_ascii_alphabetic() && c[at + 1] == ':' && sep(c[at + 2]);
+    let local = match c.as_slice() {
+        [] => false,
+        [first, ..] if !sep(*first) => !path.contains(':') || drive(0), // relative, or a drive
+        [_] => true,                                                   // the top of this computer's files
+        [_, second, ..] if !sep(*second) => *second != '?' && *second != '.', // `/home/…`, never `\??\…`
+        _ => c.len() > 3 && c[2] == '?' && sep(c[3]) && drive(4),         // only `\\?\C:\…`
+    };
+    !local
+}
+
+/// Is anything on the way from `top` down to `path` a link (or a Windows junction)? Inside
+/// a folder that may have been downloaded, a link could lead anywhere, another computer
+/// included, so pointers are never followed through one.
+fn passes_through_a_link(top: &Path, path: &Path) -> bool {
+    let mut at = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                at.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => at.push(other.as_os_str()),
+        }
+        if at.starts_with(top) && at != top && fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return true;
+        }
     }
-    // `\\?\C:\…`: this computer's own drive.
-    let rest: Vec<char> = path.chars().skip(2).collect();
-    !(rest.len() >= 4 && rest[0] == '?' && sep(rest[1]) && rest[2].is_ascii_alphabetic() && rest[3] == ':')
+    false
+}
+
+/// On Windows: did a path, once worked out in full, turn out to be on another computer?
+fn resolved_elsewhere(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..))
+    )
 }
 
 /// A pointer file's contents, when it names a place on this computer.
@@ -91,12 +126,12 @@ fn confirm(top: &Path) -> Option<(PathBuf, PathBuf)> {
     let pointer = read_pointer(&dot_git)?;
     let gitdir = pointer.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
     // Never follow a pointer to another computer: just looking there would contact it.
-    if names_another_computer(gitdir) {
+    if names_another_computer(gitdir) || passes_through_a_link(top, &top.join(gitdir)) {
         return None;
     }
     // Relative paths are relative to the worktree; an absolute one replaces it.
-    let admin = top.join(gitdir).canonicalize().ok()?;
-    let common = admin.join(local_pointer(&admin.join("commondir"))?).canonicalize().ok()?;
+    let admin = top.join(gitdir).canonicalize().ok().filter(|p| !resolved_elsewhere(p))?;
+    let common = admin.join(local_pointer(&admin.join("commondir"))?).canonicalize().ok().filter(|p| !resolved_elsewhere(p))?;
     // The worktree's entry must really sit inside the main project's git folder: that is
     // the one place a faked worktree can't write.
     if admin.parent()? != common.join("worktrees") {
@@ -423,10 +458,22 @@ mod tests {
 
     #[test]
     fn pointers_to_another_computer_are_never_followed() {
-        for remote in [r"\\server\share\x", "//server/share/x", r"\\?\UNC\server\share", r"\\.\pipe\x", r"/\server\share", r"\\?\GLOBALROOT\x"] {
+        for remote in [
+            r"\\server\share\x",
+            "//server/share/x",
+            r"\\?\UNC\server\share",
+            r"\\.\pipe\x",
+            r"/\server\share",
+            r"\\?\GLOBALROOT\x",
+            r"\??\UNC\server\share",
+            r"\??\C:\x",
+            r"/.\x",
+            "http://server/x",
+            "",
+        ] {
             assert!(names_another_computer(remote), "{remote}");
         }
-        for local in ["/home/me/project/.git/worktrees/a", "C:/Users/me/p/.git", r"C:\Users\me", "../..", r"\\?\C:\Users\me"] {
+        for local in ["/home/me/project/.git/worktrees/a", "C:/Users/me/p/.git", r"C:\Users\me", "../..", r"\\?\C:\Users\me", "/", ".git/worktrees/a"] {
             assert!(!names_another_computer(local), "{local}");
         }
     }
