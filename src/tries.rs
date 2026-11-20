@@ -317,7 +317,8 @@ impl Store {
                 return Ok(name);
             }
         }
-        let as_path = Path::new(asked).canonicalize().ok();
+        // (Never looked up when written like a place on another computer.)
+        let as_path = Some(asked).filter(|a| !crate::worktree::names_another_computer(a)).and_then(|a| Path::new(a).canonicalize().ok());
         let mut stmt = self.conn.prepare("SELECT name FROM tries WHERE path IS NOT NULL ORDER BY name")?;
         let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         let found: Vec<String> = names
@@ -380,10 +381,14 @@ impl Store {
                 // Git may store one kind of line ending and write the other into the folder.
                 // A file that only differs that way hasn't changed: start from the folder's.
                 let here = top.join(&f.path);
+                // A file the worktree has exactly as git has it is untouched: git's copy is
+                // the starting point, whatever the main project has done to it since.
                 let mut matched = false;
                 if fs::symlink_metadata(&here).is_ok_and(|m| m.is_file()) {
                     if let Ok(cur) = fs::read(&here) {
-                        if cur != f.data && crate::worktree::same_but_line_endings(&cur, &f.data) {
+                        if cur == f.data {
+                            matched = true;
+                        } else if crate::worktree::same_but_line_endings(&cur, &f.data) {
                             f.data = cur;
                             matched = true;
                         }

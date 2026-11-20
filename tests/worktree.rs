@@ -670,6 +670,40 @@ fn git_that_never_answers_is_stopped_and_the_worktree_is_not_linked() {
     assert_eq!(tries, 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn git_that_stops_part_way_through_the_files_is_stopped_too() {
+    use std::os::unix::fs::PermissionsExt;
+    let (t, home, main) = project();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "half");
+    // A git that answers everything except the files' contents.
+    let real = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout).unwrap();
+    let bin = t.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("git"), format!("#!/bin/sh\ncase \"$*\" in *cat-file*) exec sleep 60;; esac\nexec {} \"$@\"\n", real.trim())).unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let started = std::time::Instant::now();
+    let o = Command::new(ASQU)
+        .arg("status")
+        .current_dir(&wt)
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env("ASQU_HOME", &home)
+        .env("ASQU_AUTO_BACKUP", "0")
+        .env("ASQU_AUTO_UPDATE", "0")
+        .env("ASQU_TEST_GIT_SECS", "1")
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(25), "{:?}", started.elapsed());
+    // Nothing is linked and nothing is made in the worktree: the next command tries again.
+    let said = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(!o.status.success() && said.contains("git took too long to answer"), "{said}");
+    let tries: i64 = db(&main).query_row("SELECT COUNT(*) FROM tries", [], |r| r.get(0)).unwrap();
+    assert_eq!(tries, 0);
+    assert!(!wt.join(".asqu").exists());
+    assert!(run(&wt, &home, ASQU, &["status"]).contains("half"), "linked once git answers");
+}
+
 #[test]
 fn a_try_is_found_by_its_folder_and_two_folders_of_one_name_are_told_apart() {
     let (_t, home, main) = project();
@@ -771,6 +805,23 @@ fn line_endings_git_changes_never_cause_a_clash() {
     let kept = run(&main, &home, ASQU, &["try", "keep", "endings", "--no-check"]);
     assert!(kept.contains("Kept Try"), "{kept}");
     assert_eq!(text(&main.join("lines.txt")), "one (main)\ntwo\nthree\nfour\nfive (try)\n");
+}
+
+#[test]
+fn a_file_the_worktree_never_touched_is_never_part_of_its_try() {
+    let (_t, home, main) = project();
+    fs::write(main.join("lines.txt"), "one\ntwo\nthree\n").unwrap();
+    run(&main, &home, "git", &["add", "."]);
+    run(&main, &home, "git", &["commit", "-qm", "lines"]);
+    // The main project changes only the file's line endings, and saves.
+    fs::write(main.join("lines.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+    run(&main, &home, ASQU, &["save", "-w", "Windows line endings"]);
+    let wt = worktree(&main, &home, "elsewhere");
+    fs::write(wt.join("app.txt"), "one\ntwo\nthree (try)\n").unwrap();
+    let saved = run(&wt, &home, ASQU, &["save", "-w", "Edit"]);
+    assert!(!saved.contains("lines.txt"), "{saved}");
+    run(&main, &home, ASQU, &["try", "keep", "elsewhere", "--no-check"]);
+    assert_eq!(fs::read_to_string(main.join("lines.txt")).unwrap(), "one\r\ntwo\r\nthree\r\n", "the main project's change stays");
 }
 
 #[test]

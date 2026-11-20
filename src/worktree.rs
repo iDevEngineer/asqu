@@ -38,7 +38,7 @@ fn read_pointer(path: &Path) -> Option<String> {
 /// `\\??\\…`), and only looking at such a place contacts it. Accepted: a path relative to
 /// where the pointer is, a drive (`C:\\…`, also written `\\\\?\\C:\\…`), or a path from the
 /// top of this computer's files (`/home/…`).
-fn names_another_computer(path: &str) -> bool {
+pub(crate) fn names_another_computer(path: &str) -> bool {
     let sep = |c: char| c == '/' || c == '\\';
     let c: Vec<char> = path.chars().collect();
     let drive = |at: usize| c.len() > at + 2 && c[at].is_ascii_alphabetic() && c[at + 1] == ':' && sep(c[at + 2]);
@@ -182,7 +182,7 @@ pub fn identity(top: &Path) -> Option<String> {
 /// Where the worktree with this identity is now, going by git's own entry for it in the
 /// main project (git updates that when the worktree is moved).
 pub fn find_by_identity(main: &Path, id: &str) -> Option<PathBuf> {
-    let name = id.split('|').next().filter(|n| !n.is_empty() && !n.contains(['/', '\\']) && *n != "." && *n != "..")?;
+    let name = id.split('|').next().filter(|n| !n.is_empty() && !n.contains(['/', '\\', ':']) && *n != "." && *n != "..")?;
     let entry = main.join(".git").join("worktrees").join(name);
     let dot_git = follow_locally(&entry, &read_pointer(&entry.join("gitdir"))?)?;
     let top = dot_git.parent()?.to_path_buf();
@@ -451,8 +451,9 @@ pub fn read_commit(
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let child = std::sync::Arc::new(std::sync::Mutex::new(child));
     let (handed_over, finished) = (std::sync::Arc::new(AtomicU64::new(0)), std::sync::Arc::new(AtomicBool::new(false)));
+    let stopped = std::sync::Arc::new(AtomicBool::new(false));
     let watching = {
-        let (child, handed_over, finished) = (child.clone(), handed_over.clone(), finished.clone());
+        let (child, handed_over, finished, stopped) = (child.clone(), handed_over.clone(), finished.clone(), stopped.clone());
         std::thread::spawn(move || {
             let (mut seen, mut since) = (0, std::time::Instant::now());
             while !finished.load(Ordering::Relaxed) {
@@ -461,6 +462,7 @@ pub fn read_commit(
                 if now != seen {
                     (seen, since) = (now, std::time::Instant::now());
                 } else if since.elapsed() > git_answer_time() {
+                    stopped.store(true, Ordering::Relaxed);
                     if let Ok(mut child) = child.lock() {
                         let _ = child.kill(); // its answer ends, so the reading below fails
                     }
@@ -482,6 +484,8 @@ pub fn read_commit(
             reader.read_exact(&mut data)?;
             let mut newline = [0u8; 1];
             reader.read_exact(&mut newline)?;
+            // Git has answered; time spent storing the file isn't git's.
+            handed_over.fetch_add(1, Ordering::Relaxed);
             each(BaseFile { path, exec, data })?;
             handed_over.fetch_add(1, Ordering::Relaxed);
         }
@@ -497,6 +501,9 @@ pub fn read_commit(
         let _ = child.wait();
     }
     let _ = asking.join();
+    if result.is_err() && stopped.load(Ordering::Relaxed) {
+        bail!("git took too long to answer");
+    }
     result
 }
 
