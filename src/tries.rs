@@ -898,7 +898,7 @@ impl Store {
                 let (result, files) = self.run_check_clean(&merged, cmd)?;
                 (result, Some(files))
             } else {
-                let files = crate::receipt::fingerprint(&dir).ok();
+                let files = crate::receipt::Checked::of(&dir).ok();
                 (run_check(cmd, &dir)?, files)
             };
             if !result.passed {
@@ -1071,10 +1071,10 @@ impl Store {
     /// Runs a check in a brand-new folder holding only `files` (no ignored files, no
     /// borrowed packages), then removes the folder. Returns the result and the
     /// fingerprint of what was checked.
-    pub(crate) fn run_check_clean(&self, files: &Manifest, cmd: &str) -> Result<(CheckResult, (Hash, usize))> {
+    pub(crate) fn run_check_clean(&self, files: &Manifest, cmd: &str) -> Result<(CheckResult, crate::receipt::Checked)> {
         let dir = self.fresh_copy(files)?;
         let out = (|| {
-            let checked = crate::receipt::fingerprint(&dir)?;
+            let checked = crate::receipt::Checked::of(&dir)?;
             Ok((run_check(cmd, &dir)?, checked))
         })();
         let _ = fs::remove_dir_all(&dir);

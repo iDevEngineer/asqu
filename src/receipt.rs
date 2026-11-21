@@ -156,10 +156,18 @@ fn covered_files(dir: &Path) -> Result<(Vec<(String, std::path::PathBuf)>, Vec<S
 }
 
 fn fingerprint_and_uncovered(dir: &Path) -> Result<(Hash, usize, Vec<String>)> {
-    let mut all = blake3::Hasher::new();
-    all.update(b"asqu-files-v1\0");
-    let mut count = 0;
+    let (each, uncovered) = each_file(dir)?;
+    let (files, count) = combine(&each);
+    Ok((files, count, uncovered))
+}
+
+/// One covered file: its path, whether it is a link, and its own fingerprint.
+type OneFile = (String, bool, Hash);
+
+/// Each covered file's own fingerprint (the receipt file itself left out), by path.
+fn each_file(dir: &Path) -> Result<(Vec<OneFile>, Vec<String>)> {
     let (files, uncovered) = covered_files(dir)?;
+    let mut each = Vec::with_capacity(files.len());
     for (rel, abs) in files {
         if rel == FILE {
             continue;
@@ -174,13 +182,63 @@ fn fingerprint_and_uncovered(dir: &Path) -> Result<(Hash, usize, Vec<String>)> {
             let mut f = fs::File::open(&abs).with_context(|| format!("reading {rel}"))?;
             std::io::copy(&mut f, &mut one).with_context(|| format!("reading {rel}"))?;
         }
+        each.push((rel, is_link, *one.finalize().as_bytes()));
+    }
+    Ok((each, uncovered))
+}
+
+/// The fingerprint of all the files together, and how many there are.
+fn combine(each: &[OneFile]) -> (Hash, usize) {
+    let mut all = blake3::Hasher::new();
+    all.update(b"asqu-files-v1\0");
+    for (rel, is_link, one) in each {
         all.update(&(rel.len() as u64).to_le_bytes());
         all.update(rel.as_bytes());
-        all.update(&[is_link as u8]);
-        all.update(one.finalize().as_bytes());
-        count += 1;
+        all.update(&[*is_link as u8]);
+        all.update(one);
     }
-    Ok((*all.finalize().as_bytes(), count, uncovered))
+    (*all.finalize().as_bytes(), each.len())
+}
+
+/// What a check ran on: the files' fingerprint, plus each file's own, so that if the
+/// project's files turn out different afterwards Asqu can say which ones.
+#[derive(Debug, Clone)]
+pub(crate) struct Checked {
+    pub files: Hash,
+    pub count: usize,
+    each: std::collections::BTreeMap<String, (bool, Hash)>,
+}
+
+impl Checked {
+    pub(crate) fn of(dir: &Path) -> Result<Checked> {
+        let (each, _) = each_file(dir)?;
+        let (files, count) = combine(&each);
+        Ok(Checked { files, count, each: each.into_iter().map(|(rel, link, h)| (rel, (link, h))).collect() })
+    }
+
+    /// The files that differ between `self` (what was checked) and `now`, in plain words,
+    /// e.g. "changed src/a.rs, not checked .cache/x".
+    fn differences(&self, now: &Checked) -> String {
+        const SHOWN: usize = 8;
+        let mut found = Vec::new();
+        for (rel, was) in &self.each {
+            match now.each.get(rel) {
+                None => found.push(format!("missing {rel}")),
+                Some(is) if is != was => found.push(format!("changed {rel}")),
+                _ => {}
+            }
+        }
+        for rel in now.each.keys().filter(|rel| !self.each.contains_key(*rel)) {
+            found.push(format!("not checked {rel}"));
+        }
+        let more = found.len().saturating_sub(SHOWN);
+        found.truncate(SHOWN);
+        let mut text = found.join(", ");
+        if more > 0 {
+            text.push_str(&format!(", and {more} more"));
+        }
+        text
+    }
 }
 
 impl Receipt {
@@ -343,16 +401,24 @@ pub fn write_beside_files(root: &Path, r: &Receipt) -> Result<()> {
     crate::store::write_file_safely(&root.join(FILE), r.to_json().as_bytes())
 }
 
-/// Signs and stores a receipt for `checked` (the fingerprint the check ran on), as long as
-/// the project's files are those same files now. Returns why not, if not.
-pub(crate) fn issue(root: &Path, checked: (Hash, usize), check: &str, clean: bool) -> std::result::Result<Receipt, String> {
-    match fingerprint(root) {
-        Ok(now) if now.0 == checked.0 => {}
-        Ok(_) => return Err("the project's files aren't exactly the ones that were checked (they changed while the check ran, or some aren't saved in the history)".into()),
+/// Signs and stores a receipt for `checked` (the files the check ran on), as long as the
+/// project's files are those same files now. Returns why not, if not, naming the files.
+pub(crate) fn issue(root: &Path, checked: Checked, check: &str, clean: bool) -> std::result::Result<Receipt, String> {
+    match Checked::of(root) {
+        Ok(now) if now.files == checked.files => {}
+        Ok(now) => {
+            return Err(format!(
+                "the project's files aren't exactly the ones that were checked ({}). They changed while \
+                 the check ran, or aren't saved in the history: a file hidden only by a rule from \
+                 outside the project (such as .git/info/exclude) is left out of the history but \
+                 not out of a receipt, so add it to the project's .gitignore or .asquignore",
+                checked.differences(&now)
+            ))
+        }
         Err(e) => return Err(format!("{e:#}")),
     }
     let id = Identity::load_or_create().map_err(|e| format!("no signing key ({e:#})"))?;
-    let r = Receipt::sign(&id, checked, check, clean);
+    let r = Receipt::sign(&id, (checked.files, checked.count), check, clean);
     store_latest(root, &r).map_err(|e| format!("couldn't store it ({e:#})"))?;
     Ok(r)
 }
@@ -407,7 +473,7 @@ impl Store {
             let files = self.current_manifest()?;
             self.run_check_clean(&files, &cmd)?
         } else {
-            let checked = fingerprint(&root)?;
+            let checked = Checked::of(&root)?;
             (crate::tries::run_check(&cmd, &root)?, checked)
         };
         if !check.passed {

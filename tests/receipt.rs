@@ -137,6 +137,26 @@ fn a_clean_check_only_sees_the_projects_own_files() {
 }
 
 #[test]
+fn when_no_receipt_is_signed_the_files_that_differ_are_named() {
+    let (dir, home) = project();
+    let root = dir.path();
+    // A file hidden from the history by git's private exclude list, but not from a receipt.
+    fs::create_dir_all(root.join(".git/info")).unwrap();
+    fs::write(root.join(".git/info/exclude"), "hidden.txt\n").unwrap();
+    fs::write(root.join("hidden.txt"), "only here\n").unwrap();
+    let (ok, out) = asqu(root, home.path(), &["check", "--clean", "--trust-check"]);
+    assert!(out.contains("No receipt was signed") && out.contains("not checked hidden.txt"), "{ok} {out}");
+    assert!(out.contains(".gitignore or .asquignore"), "says how to fix it: {out}");
+
+    // A check that changes a project file while it runs.
+    fs::remove_file(root.join("hidden.txt")).unwrap();
+    let edits = if cfg!(windows) { "echo more>> app.js" } else { "echo more >> app.js" };
+    fs::write(root.join("asqu.toml"), format!("check = {edits:?}\n")).unwrap();
+    let (_, out) = asqu(root, home.path(), &["check", "--trust-check"]);
+    assert!(out.contains("No receipt was signed") && out.contains("changed app.js"), "{out}");
+}
+
+#[test]
 fn a_clean_check_runs_the_setup_step_first_and_its_receipt_says_clean() {
     let (dir, home) = project();
     let root = dir.path();
