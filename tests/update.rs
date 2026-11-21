@@ -40,20 +40,34 @@ impl Release {
         fs::create_dir_all(&bin).unwrap();
         let exe = bin.join("asqu");
         fs::copy(env!("CARGO_BIN_EXE_asqu"), &exe).unwrap();
-        let out = Command::new(&exe)
-            .arg("update")
-            .env("ASQU_UPDATE_BASE", format!("file://{}", self.dir.path().display()))
-            .env("ASQU_UPDATE_PUBKEY", self.public_hex())
-            .env("ASQU_HOME", self.dir.path().join("home"))
-            .output()
-            .unwrap();
+        let out = output(
+            Command::new(&exe)
+                .arg("update")
+                .env("ASQU_UPDATE_BASE", format!("file://{}", self.dir.path().display()))
+                .env("ASQU_UPDATE_PUBKEY", self.public_hex())
+                .env("ASQU_HOME", self.dir.path().join("home")),
+        );
         let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
         (exe, out.status.success(), text)
     }
 }
 
+/// Runs a program the test has just copied. On Linux, another test starting a process at
+/// the same moment can briefly hold the new file open ("Text file busy"), so try again.
+fn output(cmd: &mut Command) -> std::process::Output {
+    for _ in 0..50 {
+        match cmd.output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            other => return other.unwrap(),
+        }
+    }
+    cmd.output().unwrap()
+}
+
 fn version_of(exe: &Path) -> String {
-    String::from_utf8_lossy(&Command::new(exe).arg("--version").output().unwrap().stdout).trim().to_string()
+    String::from_utf8_lossy(&output(Command::new(exe).arg("--version")).stdout).trim().to_string()
 }
 
 #[test]
@@ -125,7 +139,7 @@ fn a_homebrew_install_is_left_to_homebrew() {
     let exe = cellar.join("asqu");
     fs::copy(env!("CARGO_BIN_EXE_asqu"), &exe).unwrap();
     assert!(asqu::update::installed_by_homebrew(&exe));
-    let out = Command::new(&exe).arg("update").env("ASQU_UPDATE_BASE", "file:///nonexistent").output().unwrap();
+    let out = output(Command::new(&exe).arg("update").env("ASQU_UPDATE_BASE", "file:///nonexistent"));
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(text.contains("brew upgrade asqu"), "{text}");
