@@ -66,7 +66,7 @@ fn clear_messages_when_nothing_matches() {
 #[test]
 fn shell_scripts_are_plain_ascii() {
     let root = env!("CARGO_MANIFEST_DIR");
-    for s in ["install.sh", "demo.sh", "scripts/release.sh", "scripts/brew-formula.sh"] {
+    for s in ["install.sh", "demo.sh", "scripts/release.sh", "scripts/brew-formula.sh", "scripts/brew.sh"] {
         let text = fs::read(format!("{root}/{s}")).unwrap();
         let bad: Vec<usize> = text.iter().enumerate().filter(|(_, b)| **b > 0x7f).map(|(i, _)| i).collect();
         assert!(bad.is_empty(), "{s} has non-ASCII bytes at {bad:?}");

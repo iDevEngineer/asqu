@@ -5,7 +5,7 @@
 # Builds Asqu for each kind of computer, packs each build with the licence, writes its
 # fingerprint (SHA-256) and signs it with the release key. The finished downloads land in
 # the project's target/dist/<version>/ folder (never saved in the history), and are then
-# sent to Cloudflare R2 by scripts/upload.sh.
+# sent to Cloudflare R2 by scripts/upload.sh. Last, scripts/brew.sh points Homebrew at them.
 #
 # The release key: kept in this Mac's Keychain under the name "asqu-release-key" (or
 # passed in ASQU_RELEASE_KEY). It is only ever given to the Asqu already installed on this
@@ -18,6 +18,7 @@
 # Settings (optional):
 #   ASQU_RELEASE_TARGETS="aarch64-apple-darwin ..."   build only these
 #   ASQU_RELEASE_UPLOAD=0                             build and sign, but don't send
+#   ASQU_RELEASE_BREW=0                               don't update Homebrew
 #   ASQU_RELEASE_LINUX_TESTS=0                        skip the Linux tests in Docker
 #   ASQU_RELEASE_NOTARISE=0                           don't sign or notarise Mac builds
 set -eu
@@ -160,4 +161,11 @@ if [ "${ASQU_RELEASE_UPLOAD:-1}" = 0 ]; then
   echo "Not sent anywhere (ASQU_RELEASE_UPLOAD=0)."
 else
   sh scripts/upload.sh "$out" "$version"
+  # The release is live by now, so a Homebrew problem mustn't report it as failed.
+  if [ "${ASQU_RELEASE_BREW:-1}" = 0 ]; then
+    echo "Homebrew left as it is (ASQU_RELEASE_BREW=0)."
+  elif ! sh scripts/brew.sh "$out" "$version"; then
+    echo "Warning: $version is live, but Homebrew wasn't updated (see above). To try again:"
+    echo "  sh \"$project/scripts/brew.sh\" \"$out\" $version"
+  fi
 fi
