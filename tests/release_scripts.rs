@@ -148,6 +148,35 @@ fn homebrew_dry_run_pushes_nothing_and_odd_versions_are_refused() {
     assert_eq!(tap.commits(), 1);
 }
 
+#[test]
+fn a_tap_with_links_cant_make_the_script_write_outside_its_copy() {
+    // The formula itself, then the folder holding it.
+    for linked in ["Formula/asqu.rb", "Formula"] {
+        let tap = Tap::holding("0.1.0");
+        tap.release("v0.2.0");
+        fs::create_dir_all(tap.at("victim")).unwrap();
+        let victim = tap.at("victim/asqu.rb");
+        fs::write(&victim, "  version \"0.1.0\"\n").unwrap();
+        let link = tap.at("seed").join(linked);
+        let to = if linked == "Formula" {
+            fs::remove_dir_all(&link).unwrap();
+            tap.at("victim")
+        } else {
+            fs::remove_file(&link).unwrap();
+            victim.clone()
+        };
+        std::os::unix::fs::symlink(to, &link).unwrap();
+        git(&tap.at("seed"), &["add", "-A"]);
+        git(&tap.at("seed"), &["commit", "-q", "-m", "link"]);
+        git(&tap.at("seed"), &["push", "-q", tap.at("tap.git").to_str().unwrap(), "HEAD"]);
+
+        let (ok, out) = tap.update("v0.2.0", false);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "  version \"0.1.0\"\n", "{linked}: {out}");
+        assert!(!ok && out.contains("isn't an ordinary file"), "{linked}: {out}");
+        assert_eq!(tap.commits(), 2);
+    }
+}
+
 /// Runs release.sh with stand-ins for the build, the signer, the upload and Homebrew.
 fn release_with(brew: &str, settings: &[(&str, &str)]) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();

@@ -61,9 +61,13 @@ as_owner() {
 }
 
 copy="$work/tap"
-as_owner clone -q "$tap" "$copy" || fail "couldn't get a copy of the tap"
+# The tap isn't trusted: a link in it could point this script at any file on this computer.
+# So links are never made in the copy, and the formula must be saved there as a plain file.
+as_owner clone -q -c core.symlinks=false "$tap" "$copy" || fail "couldn't get a copy of the tap"
 formula="$copy/Formula/asqu.rb"
-[ -f "$formula" ] || fail "the tap has no Formula/asqu.rb"
+mode="$(git -C "$copy" ls-files -s -- Formula/asqu.rb | cut -d ' ' -f 1)"
+[ "$mode" = 100644 ] && [ ! -L "$copy/Formula" ] && [ ! -L "$formula" ] && [ -f "$formula" ] ||
+  fail "the tap's Formula/asqu.rb is missing or isn't an ordinary file"
 
 new="${version#v}"
 now="$(sed -n 's/^ *version "\([0-9.]*\)".*/\1/p' "$formula")"
