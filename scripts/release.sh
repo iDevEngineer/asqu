@@ -11,10 +11,15 @@
 # passed in ASQU_RELEASE_KEY). It is only ever given to the Asqu already installed on this
 # computer, never to anything built here.
 #
+# Mac downloads are also signed with the Developer ID certificate in this Mac's Keychain
+# and notarised by Apple (checked for malware), so macOS doesn't warn about them. Apple's
+# notary key is saved with: xcrun notarytool store-credentials asqu-notary (never in files).
+#
 # Settings (optional):
 #   ASQU_RELEASE_TARGETS="aarch64-apple-darwin ..."   build only these
 #   ASQU_RELEASE_UPLOAD=0                             build and sign, but don't send
 #   ASQU_RELEASE_LINUX_TESTS=0                        skip the Linux tests in Docker
+#   ASQU_RELEASE_NOTARISE=0                           don't sign or notarise Mac builds
 set -eu
 
 version="${ASQU_RELEASE_VERSION:?run this through: asqu release <version>}"
@@ -41,6 +46,31 @@ for t in $targets; do
     *) fail "don't know how to build for $t" ;;
   esac
 done
+
+# Mac signing: a Developer ID certificate and a saved notary key, found before any building.
+notarise=""
+case "$targets" in *-apple-darwin*) [ "${ASQU_RELEASE_NOTARISE:-1}" = 0 ] || notarise=1 ;; esac
+if [ -n "$notarise" ]; then
+  identity="${ASQU_RELEASE_IDENTITY:-$(security find-identity -v -p codesigning |
+    sed -n 's/.*\([0-9A-F]\{40\}\) "Developer ID Application:.*/\1/p' | head -n 1)}"
+  [ -n "$identity" ] || fail "no Developer ID Application certificate in the Keychain (needed to sign Mac builds)"
+  xcrun notarytool history --keychain-profile asqu-notary >/dev/null 2>&1 ||
+    fail "no working notary key: save one with: xcrun notarytool store-credentials asqu-notary"
+fi
+# Signs one Mac build and has Apple notarise it; stops the release if Apple refuses it.
+# Apple is sent a zip of the signed program, made in its own temporary folder.
+sign_mac() {
+  codesign --force --options runtime --timestamp --sign "$identity" "$1/asqu"
+  codesign --verify --strict "$1/asqu" || fail "the signature on $1/asqu doesn't check out"
+  zip="$(mktemp -d "${TMPDIR:-/tmp}/asqu-notarise.XXXXXX")/asqu-$2.zip"
+  ditto -c -k "$1/asqu" "$zip"
+  echo "Waiting for Apple to notarise the $2 build (usually 1-5 minutes)..."
+  result="$(xcrun notarytool submit "$zip" --keychain-profile asqu-notary --wait 2>&1)" || true
+  case "$result" in
+    *"status: Accepted"*) echo "Apple notarised the $2 build." ;;
+    *) printf '%s\n' "$result" >&2; fail "Apple didn't notarise the $2 build (see above; xcrun notarytool log <id> --keychain-profile asqu-notary explains why)" ;;
+  esac
+}
 
 # Tests on all three systems. Mac: `asqu release` already ran them in this fresh copy.
 # Windows: this Mac can't run them, so GitHub runs them for each pushed commit; stop if
@@ -105,6 +135,7 @@ for t in $targets; do
       (cd "$built" && zip -q -j "$work/$asset" asqu.exe LICENSE.txt)
       ;;
     *)
+      case "$t" in *-apple-darwin) [ -z "$notarise" ] || sign_mac "$built" "$t" ;; esac
       asset="asqu-$t.tar.gz"
       cp LICENSE "$built/LICENSE"
       tar -czf "$work/$asset" -C "$built" asqu LICENSE
