@@ -77,7 +77,7 @@ linux_tests() {
   }
   rust="$(rustc --version | cut -d' ' -f2)"
   echo "Running the tests on Linux (Rust $rust)..."
-  docker run --rm -v "$PWD":/src -w /src \
+  docker run --rm -v "$PWD":/src:ro -w /src \
     -v asqu-linux-cargo:/usr/local/cargo/registry -v asqu-linux-target:/target \
     -e CARGO_TARGET_DIR=/target "rust:$rust-bookworm" cargo test --locked --quiet ||
     fail "the tests failed on Linux"
