@@ -8,6 +8,6 @@ Rules for any AI tool (or person) changing Asqu.
 - Plain English in every message, help text and page.
 - History is never quietly lost: anything that removes stored data is explained first, can be previewed, and never touches kept Timeline entries.
 - An AI can never approve for the person (high-risk keeps, check commands, deletions).
-- Every changed piece of logic gets a test; tests must pass on Mac, Linux and Windows.
+- Every changed piece of logic gets a test; tests must pass on Mac, Linux and Windows. `asqu release` runs the Mac tests and the Linux tests (in Docker); GitHub runs the Windows tests on each push.
 - Tests never run Asqu in the repository's own folder: always a throwaway one.
 - The Asqu view uses only the colour tokens on :root, and reuses existing classes before adding new ones. A new class never reuses an existing class name for a different meaning.

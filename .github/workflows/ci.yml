@@ -1,4 +1,6 @@
-# Runs every test on Windows, Mac and Linux for each push to main.
+# Runs every test on Windows for each push to main. Mac and Linux tests run on the release
+# Mac (`asqu release` runs them, Linux in Docker); this Mac can't run Windows tests.
+# Nothing waits for this: `asqu release` only stops if it failed for the commit released.
 name: ci
 
 on:
@@ -11,11 +13,8 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: test (windows-latest)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
