@@ -63,7 +63,10 @@ pub struct Config {
 pub fn load(root: &Path) -> Result<Config> {
     let table: toml::Table = match fs::read_to_string(root.join(FILE)) {
         Ok(text) => text.parse().with_context(|| format!("{FILE} isn't valid TOML"))?,
-        Err(_) => toml::Table::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        // There, but unreadable just now: never treated as "no settings", which would
+        // quietly drop the project's check and risk rules.
+        Err(e) => return Err(e).with_context(|| format!("couldn't read {FILE}")),
     };
     let check = match table.get("check").and_then(|v| v.as_str()) {
         Some(c) if c.trim().is_empty() => None, // explicitly off

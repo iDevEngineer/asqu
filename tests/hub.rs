@@ -469,7 +469,19 @@ fn newer_work_on_the_hub_or_a_removed_link_keeps_saves_queued() {
     drop(s);
 
     // Unlinking forgets the key; the Hub project itself is left alone.
-    assert!(ok(asqu(&p, &home, &["unlink", "hub"])).contains("Stopped sharing"));
+    // Only the person stops a project being shared: an AI or a script is refused.
+    let refused = asqu(&p, &home, &["unlink", "hub"]);
+    assert!(!refused.status.success() && text(&refused).contains("only the person"), "{}", text(&refused));
+    assert!(fs::read_to_string(home.join("hub-links.json")).unwrap().contains(TOKEN), "still linked");
+    let by_person = Command::new(env!("CARGO_BIN_EXE_asqu"))
+        .args(["unlink", "hub"])
+        .current_dir(&p)
+        .env("ASQU_HOME", &home)
+        .env("ASQU_AUTO_BACKUP", "0")
+        .env("ASQU_TEST_PERSON", "1")
+        .output()
+        .unwrap();
+    assert!(ok(by_person).contains("Stopped sharing"));
     assert!(!fs::read_to_string(home.join("hub-links.json")).unwrap().contains(TOKEN));
     assert!(!ok(asqu(&p, &home, &["status"])).contains("Hub"));
 }

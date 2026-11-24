@@ -575,26 +575,36 @@ impl Store {
         Ok(self.try_row(name)?.status == "tossed" && self.set_aside_names()?.iter().any(|n| n == name))
     }
 
+    /// Refuses a name that can't be used for a new Try: not a valid one, or already taken
+    /// by a Try of any status. Names are one whatever their capitals ("Foo" and "foo"),
+    /// because most Macs and Windows keep both in the same folder: starting the second
+    /// would wipe the first one's files.
+    fn refuse_taken_name(&self, name: &str) -> Result<()> {
+        valid_name(name)?;
+        let taken: Option<String> =
+            self.conn.query_row("SELECT name FROM tries WHERE name = ?1 COLLATE NOCASE", [name], |r| r.get(0)).optional()?;
+        if let Some(taken) = taken {
+            bail!("a Try called \"{taken}\" already exists; pick another name");
+        }
+        Ok(())
+    }
+
     /// Starts several Tries at once (e.g. one per AI), or none if any name can't be used.
     pub fn start_tries(&mut self, names: &[String], request: &str, actor: &str) -> Result<Vec<PathBuf>> {
         for (i, name) in names.iter().enumerate() {
             valid_name(name)?;
-            if names[..i].contains(name) {
+            // Whatever the capitals: on most Macs and Windows, "Foo" and "foo" are one folder.
+            if names[..i].iter().any(|n| n.eq_ignore_ascii_case(name)) {
                 bail!("\"{name}\" is listed twice; give each Try its own name");
             }
-            if self.try_row(name).is_ok() {
-                bail!("a Try called \"{name}\" already exists; pick another name");
-            }
+            self.refuse_taken_name(name)?;
         }
         names.iter().map(|n| self.start_try(n, request, actor)).collect()
     }
 
     /// Starts a Try from the latest Timeline entry and returns its working folder.
     pub fn start_try(&mut self, name: &str, request: &str, actor: &str) -> Result<PathBuf> {
-        valid_name(name)?;
-        if self.try_row(name).is_ok() {
-            bail!("a Try called \"{name}\" already exists; pick another name");
-        }
+        self.refuse_taken_name(name)?;
         // Start from exactly what's on disk now.
         self.save(&Why { actor: actor.into(), ..Default::default() })?;
         let base = self.head_seq()?.context("nothing to try yet: the project has no files")?;
@@ -620,10 +630,7 @@ impl Store {
     /// used for the Hub's version of files that clashed, so keeping the Try later combines
     /// from the version both sides last had. The main project is not changed.
     pub(crate) fn start_try_with(&mut self, name: &str, request: &str, base: &Manifest, files: &Manifest) -> Result<PathBuf> {
-        valid_name(name)?;
-        if self.try_row(name).is_ok() {
-            bail!("a Try called \"{name}\" already exists; pick another name");
-        }
+        self.refuse_taken_name(name)?;
         let base_seq = self.head_seq()?.unwrap_or(0);
         let base_hash = self.put_blob_near(&self.conn, &Store::encode_manifest(base), None)?;
         let manifest_hash = self.put_blob_near(&self.conn, &Store::encode_manifest(files), Some(&base_hash))?;
@@ -936,6 +943,18 @@ impl Store {
             checked = files;
         }
 
+        // A check can take a while. Anything changed in the main project meanwhile is
+        // saved now (so it can't be lost) and never written over: the result was worked
+        // out, shown and checked without it.
+        if check.is_some() {
+            self.save(&first)?;
+            if self.current_manifest()? != ours {
+                bail!(
+                    "the main project changed while the check was running, so nothing was kept. \
+                     Those changes are saved. Run the keep again to combine the Try with them"
+                );
+            }
+        }
         let root = self.root().to_path_buf();
         self.apply(&root, &changes, &merged)?;
         let request = if row.request.trim().is_empty() { format!("Kept try \"{name}\"") } else { row.request.clone() };

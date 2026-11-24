@@ -244,6 +244,12 @@ pub fn set_caller_folder(dir: &Path) {
     let _ = CALLER_FOLDER.set(dir.to_path_buf());
 }
 
+/// Tools that may begin a project's history. Every other tool only looks at, or changes,
+/// a history that is already there, and never starts one.
+pub fn starts_history(name: &str) -> bool {
+    matches!(name, "asqu_save" | "asqu_try_start" | "asqu_set_intent")
+}
+
 /// Runs one tool call. `args` is the JSON object the model produced.
 pub fn call(root: &Path, name: &str, args: &Value, actor: &str) -> Result<Value> {
     call_from(root, CALLER_FOLDER.get().map(|p| p.as_path()).unwrap_or(root), name, args, actor)
@@ -268,6 +274,11 @@ pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str
                 return Ok(json!({ "summary": "No history here yet.", "changes": 0, "undos": 0,
                     "tries_kept": 0, "tries_tossed": 0, "tries_open": 0, "by": {}, "history": false }))
             }
+            "asqu_show" | "asqu_undo" | "asqu_back" | "asqu_mark" | "asqu_try_compare" | "asqu_try_keep"
+            | "asqu_try_toss" | "asqu_try_update" | "asqu_try_reopen" => {
+                bail!("No history here yet, so there is nothing for {name} to work on. The first asqu_save starts one.")
+            }
+            other if !starts_history(other) => bail!("unknown tool \"{other}\""),
             _ => {}
         }
     }

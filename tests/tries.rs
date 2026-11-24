@@ -363,3 +363,50 @@ fn choosing_the_try_for_a_file_only_main_changed_never_undoes_main() {
     store.keep_try("t", KeepOptions { take, ..Default::default() }, "me").unwrap();
     assert_eq!(read(&dir.path().join("extra.txt")), "main only\n");
 }
+
+#[test]
+fn a_name_in_other_capitals_is_the_same_try() {
+    let (_dir, mut store) = setup();
+    let t = store.start_try("foo", "", "t").unwrap();
+    fs::write(t.join("new.txt"), "not saved yet").unwrap();
+
+    // On most Macs and Windows "Foo" would be the same folder: starting it would wipe "foo".
+    let err = store.start_try("Foo", "", "t").unwrap_err().to_string();
+    assert!(err.contains("\"foo\" already exists"), "{err}");
+    assert_eq!(read(&t.join("new.txt")), "not saved yet", "the first Try's work is untouched");
+
+    let err = store.start_tries(&["red".into(), "RED".into()], "", "t").unwrap_err().to_string();
+    assert!(err.contains("listed twice"), "{err}");
+    let err = store.start_tries(&["blue".into(), "FOO".into()], "", "t").unwrap_err().to_string();
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(store.list_tries().unwrap().len(), 1, "none started when one name can't be used");
+}
+
+#[test]
+fn edits_made_in_the_main_project_while_the_check_runs_are_never_written_over() {
+    let (dir, mut store) = setup();
+    // A check that passes, and (like a person or another AI working meanwhile) changes
+    // a file in the main project while it runs. It runs in the Try's folder.
+    let check = if cfg!(windows) { "echo edited> ..\\..\\..\\README.md" } else { "echo edited > ../../../README.md" };
+    fs::write(dir.path().join("asqu.toml"), format!("check = {check:?}\n")).unwrap();
+    store.save(&Why::default()).unwrap();
+
+    let t = store.start_try("both", "", "t").unwrap();
+    fs::write(t.join("README.md"), "# The Try's own README\n").unwrap();
+    fs::write(t.join("app.js"), "line1\nTRY\nline3\n").unwrap();
+    let allow = KeepOptions { trust_check: true, ..Default::default() };
+    let err = store.keep_try("both", allow, "t").unwrap_err().to_string();
+    assert!(err.contains("changed while the check was running"), "{err}");
+    // Nothing was kept, and the edit is on disk and in the history.
+    assert_eq!(read(&dir.path().join("README.md")).trim(), "edited");
+    assert_eq!(read(&dir.path().join("app.js")), "line1\nline2\nline3\n");
+    assert!(store.status().unwrap().is_empty(), "the edit was saved");
+
+    // Asked again, both sides changed README.md: it is a clash to settle, not a silent overwrite.
+    match store.keep_try("both", KeepOptions::default(), "t").unwrap() {
+        KeepOutcome::Clash { files, .. } => assert_eq!(files, vec!["README.md".to_string()]),
+        other => panic!("expected a clash, got {other:?}"),
+    }
+    assert_eq!(read(&dir.path().join("README.md")).trim(), "edited");
+    assert!(store.verify().unwrap().is_empty());
+}

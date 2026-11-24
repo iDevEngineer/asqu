@@ -338,7 +338,10 @@ fn read(path: &Path) -> Result<Value> {
                 path.display()
             )
         }),
-        _ => Ok(Value::Null),
+        Ok(_) => Ok(Value::Null),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+        // There, but unreadable just now: never rewritten as if it were empty.
+        Err(e) => Err(e).with_context(|| format!("couldn't read {}, so Asqu won't change it", path.display())),
     }
 }
 

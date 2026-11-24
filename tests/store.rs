@@ -222,3 +222,22 @@ fn a_file_another_program_has_locked_never_stops_a_save() {
     let later = store.save(&why("after")).unwrap().unwrap();
     assert!(later.changes.modified.contains(&".tool/state.lock".to_string()), "{:?}", later.changes);
 }
+
+#[test]
+fn verify_notices_an_entry_whose_files_are_no_longer_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.txt", b"one");
+    let mut store = Store::open_or_create(dir.path()).unwrap();
+    store.save(&why("first")).unwrap();
+    write(dir.path(), "a.txt", b"second!");
+    store.save(&why("second")).unwrap();
+    assert!(store.verify().unwrap().is_empty());
+    drop(store);
+
+    // The stored content of the latest a.txt disappears. The chain of entries is still whole.
+    exec(dir.path(), "PRAGMA foreign_keys = OFF; DELETE FROM blobs WHERE size = 7");
+    let store = Store::open_or_create(dir.path()).unwrap();
+    let problems = store.verify().unwrap();
+    assert!(problems.iter().any(|p| p.contains("entry 2") && p.contains("missing")), "{problems:?}");
+    assert!(!problems.iter().any(|p| p.contains("entry 1")), "{problems:?}");
+}

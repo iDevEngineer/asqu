@@ -148,7 +148,10 @@ pub fn link(root: &Path) -> Option<Link> {
 }
 
 fn save_link(root: &Path, link: &Link) -> Result<()> {
-    let mut all = read_links();
+    let mut all = backup::read_json_for_change(
+        &links_file()?,
+        "Projects shared on a Hub before need linking again (`asqu link hub`). Nothing on the Hub is lost.",
+    )?;
     all[backup::key(root)] = link.to_json();
     backup::write_private_json(&links_file()?, &all)
 }
@@ -156,7 +159,10 @@ fn save_link(root: &Path, link: &Link) -> Result<()> {
 /// Forgets this project's Hub link (the project and its history on the Hub are kept).
 /// Returns false if it had none.
 pub fn unlink(root: &Path) -> Result<bool> {
-    let mut all = read_links();
+    let mut all = backup::read_json_for_change(
+        &links_file()?,
+        "Projects shared on a Hub before need linking again (`asqu link hub`). Nothing on the Hub is lost.",
+    )?;
     let removed = all.as_object_mut().is_some_and(|o| o.remove(&backup::key(root)).is_some());
     if removed {
         backup::write_private_json(&links_file()?, &all)?;

@@ -10,7 +10,7 @@ use crate::hash::{self, Hash};
 use crate::{describe, scan};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -849,7 +849,8 @@ impl Store {
 
         let cfg = crate::config::load(&self.root)?;
         // The size limit is only for files that were never saved: a file already in the
-        // history stays recorded however big it gets, so its changes can always be undone.
+        // history (the project's, or this Try's own saves) stays recorded however big it
+        // gets, so its changes can always be undone and it is never left out of a keep.
         let head = self.head_manifest()?;
         let mut skipped = Vec::new();
         let mut m = Manifest::new();
@@ -860,7 +861,7 @@ impl Store {
                 Err(e) => return Err(e.into()),
             };
             // Huge files (videos and the like) don't belong in the history.
-            if cfg.too_big(&rel, meta.len()) && !head.contains_key(&rel) {
+            if cfg.too_big(&rel, meta.len()) && !head.contains_key(&rel) && !last_saved.is_some_and(|m| m.contains_key(&rel)) {
                 skipped.push(rel);
                 continue;
             }
@@ -1513,6 +1514,35 @@ impl Store {
             // Read back exactly as a restore would (undoing compression and differences).
             if !self.get_blob(&h).is_ok_and(|data| hash::of(&data) == h) {
                 problems.push(format!("stored content {} is damaged", hash::short(&h)));
+            }
+        }
+        // Every Timeline entry: the list of its files, and each file in it, must still be
+        // stored (an entry can be whole in the chain above and still point at nothing).
+        {
+            let stored: HashSet<Vec<u8>> = {
+                let mut stmt = self.conn.prepare("SELECT hash FROM blobs")?;
+                let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                rows
+            };
+            let mut stmt = self.conn.prepare("SELECT seq, manifest FROM timeline ORDER BY seq")?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            // Most entries share most files: each list is only looked into once.
+            let mut whole: HashMap<Vec<u8>, bool> = HashMap::new();
+            for (seq, manifest) in rows {
+                let ok = match whole.get(&manifest) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = stored.contains(&manifest)
+                            && hash::from_slice(&manifest)
+                                .and_then(|h| self.manifest_from_hash(&h).ok())
+                                .is_some_and(|m| m.values().all(|f| stored.contains(&f.hash[..])));
+                        whole.insert(manifest, ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    problems.push(format!("entry {seq}: some of its files are missing from the history"));
+                }
             }
         }
         // Open Tries: the files each holds, and where it started, must still be stored.

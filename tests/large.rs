@@ -80,3 +80,25 @@ fn a_big_file_can_be_kept_on_purpose() {
     assert!(ok && !err.contains("not saving"), "{err}");
     assert!(asqu(&p, &home, &["show", "1"]).1.contains("assets/data.zip"));
 }
+
+#[test]
+fn a_file_first_saved_in_a_try_is_kept_however_big_it_gets() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let p = t.path().join("site");
+    fs::create_dir_all(&p).unwrap();
+    fs::write(p.join("asqu.toml"), "max_file_mb = 1\n").unwrap();
+    fs::write(p.join("app.js"), "one").unwrap();
+    assert!(asqu(&p, &home, &["save"]).0);
+
+    assert!(asqu(&p, &home, &["try", "start", "data"]).0);
+    let folder = p.join(".asqu/tries/data");
+    fs::write(folder.join("rows.csv"), vec![b'a'; MB / 2]).unwrap();
+    assert!(asqu(&folder, &home, &["save"]).0);
+    // It grows past the limit. It is this Try's file already, so it stays recorded:
+    // keeping the Try brings it into the project (and only then is the Try's folder removed).
+    fs::write(folder.join("rows.csv"), vec![b'z'; 2 * MB]).unwrap();
+    let (ok, out, err) = asqu(&p, &home, &["try", "keep", "data"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(fs::read(p.join("rows.csv")).unwrap(), vec![b'z'; 2 * MB]);
+}

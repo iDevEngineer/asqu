@@ -607,18 +607,20 @@ fn move_aside(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn setup_command(store: &mut Store, yes: bool, remove: bool, ai: Vec<String>, list: bool) -> Result<()> {
+/// `asqu setup --list`: only prints. It needs no history and never starts one.
+fn list_ai_tools() {
+    use asqu::aitools;
+    println!("AI tools Asqu can set up (use with --ai):");
+    for t in aitools::TOOLS {
+        println!("  {:<12} {}", t.id, t.name);
+    }
+    println!("{} have no way to run a command on events; the AGENTS.md note and", aitools::WITHOUT_HOOKS);
+    println!("the file watcher (asqu watch, or asqu open) cover them.");
+}
+
+fn setup_command(store: &mut Store, yes: bool, remove: bool, ai: Vec<String>) -> Result<()> {
     use asqu::aitools;
     use std::io::IsTerminal;
-    if list {
-        println!("AI tools Asqu can set up (use with --ai):");
-        for t in aitools::TOOLS {
-            println!("  {:<12} {}", t.id, t.name);
-        }
-        println!("{} have no way to run a command on events; the AGENTS.md note and", aitools::WITHOUT_HOOKS);
-        println!("the file watcher (asqu watch, or asqu open) cover them.");
-        return Ok(());
-    }
     let root = store.root().to_path_buf();
     let root = root.as_path();
     let interactive = !yes && std::io::stdin().is_terminal();
@@ -910,6 +912,17 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
             }
             // Approvals only count for exactly what the person was shown: ask about the
             // result as it is now, then keep that result (if it changed meanwhile, ask again).
+            // Skipping the project's check is the person's call, never an AI's or a script's.
+            if no_check {
+                let cfg = asqu::config::load(store.root())?;
+                if let Some(cmd) = cfg.check_command(cfg.clean) {
+                    println!("This project's check is `{}`.", printable(&cmd));
+                    if !asqu::platform::person_confirms("Keep without running it?")? {
+                        println!("Not confirmed. Nothing was kept.");
+                        std::process::exit(1);
+                    }
+                }
+            }
             let mut opts = KeepOptions { skip_check: no_check, prefer_try, take: chosen.clone(), ..Default::default() };
             let outcome = loop {
                 let outcome = store.keep_try(&name, opts.clone(), &actor())?;
@@ -1241,7 +1254,11 @@ fn tidy_command(store: &mut Store, dry_run: bool) -> Result<()> {
         said = true;
     }
     if r.rollback_copy_removed {
-        println!("Removed the copy of the history kept for older Asqu versions (over 7 days old).");
+        if dry_run {
+            println!("The copy of the history kept for older Asqu versions (over 7 days old) would be removed.");
+        } else {
+            println!("Removed the copy of the history kept for older Asqu versions (over 7 days old).");
+        }
         said = true;
     }
     if !said {
@@ -1636,7 +1653,7 @@ fn main() -> Result<()> {
         );
         // An AI tool that only looks gets its answer without a history being made.
         if let Command::Call { tool, args } = &cli.command {
-            if matches!(tool.as_str(), "asqu_status" | "asqu_log" | "asqu_try_list" | "asqu_summary" | "asqu_brief") {
+            if !asqu::tools::starts_history(tool) {
                 let _ = args;
                 let answer = asqu::tools::call(&cwd, tool, &serde_json::json!({}), &actor())?;
                 println!("{}", serde_json::to_string_pretty(&answer)?);
@@ -1672,6 +1689,11 @@ fn main() -> Result<()> {
         }
     }
 
+    if let Command::Setup { list: true, .. } = cli.command {
+        list_ai_tools();
+        return Ok(());
+    }
+
     let mut store = Store::open_or_create(&cwd)?;
     let project_root = store.root().to_path_buf();
 
@@ -1692,6 +1714,13 @@ fn main() -> Result<()> {
         }
         Command::Unlink { place, .. } if place == "hub" => {
             let name = asqu::hub::link(store.root()).map(|l| asqu::hub::hub_name(&l.hub).to_string());
+            // Like unlinking a backup: only the person stops a project being shared.
+            if let Some(hub) = &name {
+                if !asqu::platform::person_confirms(&format!("Stop sharing this project with the Hub at {}?", printable(hub)))? {
+                    println!("Not unlinked.");
+                    return Ok(());
+                }
+            }
             if asqu::hub::unlink(store.root())? {
                 println!(
                     "Stopped sharing this project with the Hub at {}. The Hub project and its history are kept.",
@@ -1925,7 +1954,7 @@ fn main() -> Result<()> {
                 println!("Got it. Changes will be saved as: \"{}\"", request.trim());
             }
         }
-        Command::Setup { yes, remove, ai, list } => setup_command(&mut store, yes, remove, ai, list)?,
+        Command::Setup { yes, remove, ai, .. } => setup_command(&mut store, yes, remove, ai)?,
         Command::Mark { name } => {
             let seq = store.mark(&name, &actor())?;
             println!("Marked #{seq} as \"{name}\". Return any time with `asqu back \"{name}\"`.");

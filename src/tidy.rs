@@ -90,6 +90,8 @@ impl Store {
             // Work out the rest as if the tiers had been applied, then undo everything.
             report.versions = self.unneeded_versions(now)?.len();
             report.compressed = self.uncompressed_count()?;
+            report.rollback_copy_removed =
+                ROLLBACK_COPIES.iter().any(|name| rollback_copy_is_old(&self.root().join(DIR).join(name)));
             drop(tx);
             report.bytes_after = report.bytes_before;
             return Ok(report);
@@ -130,13 +132,7 @@ impl Store {
 
         for name in ROLLBACK_COPIES {
             let copy = self.root().join(DIR).join(name);
-            let old_enough = fs::symlink_metadata(&copy)
-                .ok()
-                .filter(|m| m.is_file())
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age.as_secs() > ROLLBACK_KEEP_SECS);
-            if old_enough && fs::remove_file(&copy).is_ok() {
+            if rollback_copy_is_old(&copy) && fs::remove_file(&copy).is_ok() {
                 report.rollback_copy_removed = true;
             }
         }
@@ -382,6 +378,16 @@ pub fn nudge(store: &Store) {
         .stderr(Stdio::null());
     crate::platform::detach(&mut cmd);
     let _ = cmd.spawn();
+}
+
+/// Is this copy of the history (kept for older Asqu versions) old enough for tidy to remove?
+fn rollback_copy_is_old(copy: &Path) -> bool {
+    fs::symlink_metadata(copy)
+        .ok()
+        .filter(|m| m.is_file())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() > ROLLBACK_KEEP_SECS)
 }
 
 fn lock_path(root: &Path) -> std::path::PathBuf {

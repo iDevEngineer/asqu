@@ -518,6 +518,10 @@ function renderBackups(b) {
     el("div", { class: "what" }, x.status),
     el("button", { onclick: () => stopBackup(x.place, x.all) }, "Stop")));
   if (!rows.length) rows.push(el("div", { class: "none" }, "Not backed up anywhere yet. Your history is only on this computer."));
+  // Shared on a Hub: said here too, and only the person can stop it.
+  if (b.hub) rows.push(el("div", { class: "backup" + (b.hub.includes("stopped") ? " bad" : "") },
+    el("div", { class: "what" }, b.hub),
+    PERSON ? el("button", { onclick: stopSharing }, "Stop sharing") : null));
   rows.push(el("div", {}, el("button", { class: b.linked.length ? "" : "primary", onclick: () => chooseBackup(b.found) },
     b.linked.length ? "Add another backup place" : "Choose backup place")));
   $("backups").replaceChildren(...rows);
@@ -563,6 +567,14 @@ async function chooseBackup(found) {
       : `Backed up to ${r.place}. From now on it happens automatically.`);
   } catch (e) { toast(e.message); }
   refresh();
+}
+
+async function stopSharing() {
+  if (!(await confirmBox("Stop sharing this project with the Hub?", [
+    el("p", {}, "The project on the Hub and its history are kept. New changes made here won't be sent, and work from the Hub won't come in."),
+    el("p", {}, "You can share it again later.")], "Stop sharing"))) return;
+  try { await api("/ui/hub/unlink", {}); toast("Stopped sharing with the Hub."); refresh(); }
+  catch (e) { toast(e.message); }
 }
 
 async function stopBackup(place, all) {
