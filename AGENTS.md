@@ -3,6 +3,7 @@
 Rules for any AI tool (or person) changing Asqu.
 
 - Use only AGENTS.md for agent instructions; don't add a CLAUDE.md (Claude Code reads AGENTS.md only when no CLAUDE.md exists).
+- This folder is changed only by a session opened in it. A session working on another project (AsquHub, say) makes no edits, commits, branches or builds here unless the person explicitly approves it for that piece of work.
 - Tool-agnostic like git: no tool-specific options unless every tool is covered the same way.
 - This repo is public. Never commit secrets, keys, account IDs or private server details. Release keys and tokens live in the Keychain or in GitHub secrets, never in files.
 - Plain English in every message, help text and page.
