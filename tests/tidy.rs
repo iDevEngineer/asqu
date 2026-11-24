@@ -267,3 +267,18 @@ fn big_files_stay_while_the_copy_for_older_asqu_needs_them() {
     store.tidy(false).unwrap();
     assert_eq!(large(), 1, "the older copy may still point at it");
 }
+
+#[test]
+fn a_dry_run_says_when_the_copy_for_older_asqu_would_go() {
+    let (dir, mut store) = project();
+    let copy = dir.path().join(".asqu/store-v5.db");
+    fs::write(&copy, b"stand-in").unwrap();
+    assert!(!store.tidy(true).unwrap().rollback_copy_removed, "a week hasn't passed");
+
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+    fs::File::options().write(true).open(&copy).unwrap().set_modified(old).unwrap();
+    assert!(store.tidy(true).unwrap().rollback_copy_removed, "the preview says it would be removed");
+    assert!(copy.exists(), "a dry run removes nothing");
+    assert!(store.tidy(false).unwrap().rollback_copy_removed);
+    assert!(!copy.exists());
+}

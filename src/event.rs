@@ -23,6 +23,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 const MAX_REQUEST_CHARS: usize = 500;
+/// How long an AI's request waits, at most, for newer work from the Hub.
+const PROMPT_HUB_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -165,7 +167,14 @@ pub fn handle(kind: Option<Kind>, ai: Option<&str>, input: &str, actor: &str) ->
             if prompt.trim().is_empty() {
                 return Ok(());
             }
-            let store = Store::open_or_create(&cwd)?;
+            let mut store = Store::open_or_create(&cwd)?;
+            if store.try_for_path(&cwd).is_none() {
+                // The AI starts from everyone's latest work: newer saves on the Hub are
+                // brought in first (briefly, quietly; whatever doesn't arrive in time comes
+                // later). Then files aren't changed under it until its turn ends.
+                let _ = crate::hub::receive_and_record(&mut store, Some(PROMPT_HUB_LIMIT), Some(&session));
+                crate::hub::turn_started(store.root(), &session);
+            }
             store.set_session_prompt(&session, &shorten(&prompt))?;
             if let Some(name) = store.try_for_path(&cwd) {
                 // Asked inside a Try's folder (a worktree, say): it labels that Try's saves,
@@ -199,6 +208,7 @@ pub fn handle(kind: Option<Kind>, ai: Option<&str>, input: &str, actor: &str) ->
                 store.save_try(&name, &why)?; // work done in a Try's folder belongs to that Try
                 store.clear_try_intent(&name)?; // the task is finished
             } else {
+                crate::hub::turn_ended(store.root(), &session); // work from the Hub may come in again
                 store.save(&why)?;
                 store.clear_intent(); // the task is finished
             }

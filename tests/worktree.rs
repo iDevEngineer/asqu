@@ -978,3 +978,21 @@ fn files_that_mix_line_endings_show_only_real_changes() {
     assert_eq!(fs::read_to_string(main.join("lines.txt")).unwrap(), "one (main)\ntwo\nthree\nfour\nfive\nsix (try)\n");
     assert_eq!(fs::read_to_string(main.join("mixed.txt")).unwrap(), "one\r\ntwo\n", "the main project's own file is left as it is");
 }
+
+#[test]
+fn a_try_whose_check_couldnt_run_is_never_the_suggestion() {
+    let (_t, home, main) = project();
+    let check = if cfg!(windows) { "exit 0" } else { "true" };
+    fs::write(main.join("asqu.toml"), format!("check = {check:?}\n")).unwrap();
+    run(&main, &home, ASQU, &["save", "-w", "Start"]);
+    let wt = worktree(&main, &home, "lost");
+    fs::write(wt.join("app.txt"), "one\ntwo\nthree, improved\n").unwrap();
+    run(&wt, &home, ASQU, &["save", "-w", "Improve"]);
+    // Its folder disappears, so the check has nowhere to run.
+    run(&main, &home, "git", &["worktree", "remove", "--force", ".claude/worktrees/lost"]);
+
+    let (ok, out) = person(&main, &home, &["try", "compare", "--trust-check"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("couldn't run"), "{out}");
+    assert!(!out.contains("Suggested:") && out.contains("No suggestion: its check couldn't run"), "{out}");
+}

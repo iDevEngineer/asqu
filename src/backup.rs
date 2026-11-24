@@ -240,12 +240,64 @@ fn read_links() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// A settings file about to be changed: `{}` when there is none yet. One that is there
+/// is never quietly treated as empty (writing it back would wipe every other project's
+/// entry in it): if it can't be read just now, nothing is changed; if it is damaged, Asqu
+/// sets it aside under a new name, starts a fresh one and says so. The person never has
+/// to repair a file by hand. `redo` says what then needs setting up again ("" for
+/// nothing worth mentioning).
+pub(crate) fn read_json_for_change(path: &Path, redo: &str) -> Result<Value> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(e) => return Err(e).with_context(|| format!("couldn't read {}, so it wasn't changed", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) if v.is_object() => Ok(v),
+        _ => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let mut aside = path.with_file_name(format!("{name}.damaged-{stamp}"));
+            let mut n = 1;
+            while fs::symlink_metadata(&aside).is_ok() {
+                n += 1;
+                aside = path.with_file_name(format!("{name}.damaged-{stamp}-{n}"));
+            }
+            fs::rename(path, &aside)
+                .with_context(|| format!("{} is damaged and couldn't be set aside, so it wasn't changed", path.display()))?;
+            eprintln!(
+                "asqu: one of Asqu's own settings files was damaged, so Asqu started a fresh one. \
+                 The damaged one is kept as {}.{}",
+                aside.display(),
+                if redo.is_empty() { String::new() } else { format!(" {redo}") }
+            );
+            Ok(json!({}))
+        }
+    }
+}
+
+fn links_for_change() -> Result<Value> {
+    read_json_for_change(
+        &links_file()?,
+        "Backup places chosen before need choosing again (`asqu link`, or in the Asqu view: `asqu open`). \
+         The backups already made are still where they were.",
+    )
+}
+
 fn write_links(all: &Value) -> Result<()> {
     let path = links_file()?;
-    fs::create_dir_all(path.parent().unwrap())?;
-    let tmp = path.with_extension("json.tmp");
+    let dir = path.parent().context("no folder for the settings")?;
+    fs::create_dir_all(dir)?;
+    // A name of its own, so two runs writing at once never share a half-written file.
+    let tmp = tempfile_in(dir, "links")?;
     fs::write(&tmp, serde_json::to_string_pretty(all)?)?;
-    fs::rename(tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -291,7 +343,7 @@ pub fn link_everywhere(place: &Place) -> Result<bool> {
     if let Place::Cloud { endpoint, .. } = place {
         remember_credentials(endpoint)?;
     }
-    let mut all = read_links();
+    let mut all = links_for_change()?;
     let mut list = all[EVERYWHERE].as_array().cloned().unwrap_or_default();
     if list.iter().filter_map(Place::from_json).any(|p| &p == place) {
         return Ok(false);
@@ -304,7 +356,7 @@ pub fn link_everywhere(place: &Place) -> Result<bool> {
 
 /// Puts this project back into a place used by all projects, if it had been taken out.
 pub fn include(root: &Path, place: &Place) -> Result<()> {
-    let mut all = read_links();
+    let mut all = links_for_change()?;
     let skips = all[skip_key(root)].as_array().cloned().unwrap_or_default();
     all[skip_key(root)] = Value::Array(skips.into_iter().filter(|v| Place::from_json(v).as_ref() != Some(place)).collect());
     write_links(&all)
@@ -312,7 +364,7 @@ pub fn include(root: &Path, place: &Place) -> Result<()> {
 
 /// Stops backing every project up to `place` (backups already there are kept).
 pub fn unlink_everywhere(place: &Place) -> Result<bool> {
-    let mut all = read_links();
+    let mut all = links_for_change()?;
     let list = all[EVERYWHERE].as_array().cloned().unwrap_or_default();
     let kept: Vec<Value> = list.iter().filter(|v| Place::from_json(v).as_ref() != Some(place)).cloned().collect();
     let removed = kept.len() != list.len();
@@ -326,7 +378,7 @@ pub fn link(root: &Path, place: &Place) -> Result<bool> {
     if let Place::Cloud { endpoint, .. } = place {
         remember_credentials(endpoint)?;
     }
-    let mut all = read_links();
+    let mut all = links_for_change()?;
     // Linking a place this project was taken out of brings it back.
     let skips = all[skip_key(root)].as_array().cloned().unwrap_or_default();
     all[skip_key(root)] = Value::Array(skips.into_iter().filter(|v| Place::from_json(v).as_ref() != Some(place)).collect());
@@ -345,7 +397,7 @@ pub fn link(root: &Path, place: &Place) -> Result<bool> {
 /// Stops backing up to a place (the backup already there is left alone).
 /// For a place used by all projects, this takes just this project out of it.
 pub fn unlink(root: &Path, place: &Place) -> Result<bool> {
-    let mut all = read_links();
+    let mut all = links_for_change()?;
     let list = all[key(root)].as_array().cloned().unwrap_or_default();
     let kept: Vec<Value> = list.iter().filter(|v| Place::from_json(v).as_ref() != Some(place)).cloned().collect();
     let mut removed = kept.len() != list.len();
@@ -390,27 +442,32 @@ fn remember_credentials(endpoint: &str) -> Result<()> {
     };
     let path = credentials_file()?;
     fs::create_dir_all(path.parent().unwrap())?;
-    let mut all: Value =
-        fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
+    let mut all = read_json_for_change(&path, "Storage access keys remembered before need giving again.")?;
     all[endpoint] = json!({ "id": id, "secret": secret });
     write_private_json(&path, &all)
 }
 
 /// Writes a settings file holding secrets, readable only by this person, in one step.
 pub(crate) fn write_private_json(path: &Path, all: &Value) -> Result<()> {
-    fs::create_dir_all(path.parent().context("no folder for the settings")?)?;
-    let tmp = path.with_extension("json.tmp");
-    let _ = fs::remove_file(&tmp); // a fresh file, so it gets the private permissions below
-    {
+    let dir = path.parent().context("no folder for the settings")?;
+    fs::create_dir_all(dir)?;
+    // A fresh file with a name of its own: it gets the private permissions below, and two
+    // runs writing at once never share it.
+    let tmp = tempfile_in(dir, "settings")?;
+    let written = (|| -> Result<()> {
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
         use std::io::Write;
         opts.open(&tmp)?.write_all(serde_json::to_string_pretty(all)?.as_bytes())?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(tmp, path)?;
-    Ok(())
+    written
 }
 
 fn stored_credentials(endpoint: &str) -> Option<(String, String)> {
@@ -587,11 +644,18 @@ fn large_files(root: &Path) -> Vec<String> {
 /// Backs the project up to one place now. Returns the entry number now backed up.
 pub fn back_up(store: &Store, place: &Place) -> Result<i64> {
     let name = backup_name(store)?;
-    let seq = store.head_seq()?.unwrap_or(0);
     let asqu_dir = store.root().join(DIR);
     let snapshot = tempfile_in(&asqu_dir, "snapshot")?;
     store.snapshot_db(&snapshot)?;
-    let head = store.head_hash()?.map(|h| crate::hash::hex(&h)).unwrap_or_default();
+    // What the copy itself holds, not the live history a moment before or after: a save
+    // in between would make `info.json` describe a different history than `store.db`.
+    let (seq, head) = match latest_in(&snapshot) {
+        Ok(found) => found,
+        Err(e) => {
+            let _ = fs::remove_file(&snapshot);
+            return Err(e);
+        }
+    };
     let info = json!({
         "name": name,
         "seq": seq,
@@ -614,12 +678,15 @@ pub fn back_up(store: &Store, place: &Place) -> Result<i64> {
                 }
                 dest.create_dir_all("large")?;
                 let large = dest.open_dir("large").context("refusing to back up through a linked folder")?;
-                copy_into(&snapshot, &dest, "store.db")?;
+                // Big files first (each is named after its contents and never changes), then
+                // the history that points to them, then `info.json`: stopped part-way, the
+                // backup already there is still whole.
                 for f in large_files(store.root()) {
                     if !large.exists(&f) {
                         copy_into(&asqu_dir.join("large").join(&f), &large, &f)?;
                     }
                 }
+                copy_into(&snapshot, &dest, "store.db")?;
                 let tmp = temp_name("info")?;
                 dest.write(&tmp, serde_json::to_string_pretty(&info)?)?;
                 dest.rename(&tmp, &dest, "info.json")?;
@@ -633,13 +700,14 @@ pub fn back_up(store: &Store, place: &Place) -> Result<i64> {
                 };
                 let _ = fs::remove_file(&tmp);
                 guard_against_overwrite(store, &existing?, &place.label())?;
-                cloud.put(&format!("{name}/store.db"), &snapshot)?;
+                // Big files first, as for a folder.
                 for f in large_files(store.root()) {
                     let rel = format!("{name}/large/{f}");
                     if !cloud.exists(&rel)? {
                         cloud.put(&rel, &asqu_dir.join("large").join(&f))?;
                     }
                 }
+                cloud.put(&format!("{name}/store.db"), &snapshot)?;
                 let tmp = tempfile_in(&asqu_dir, "info")?;
                 fs::write(&tmp, serde_json::to_string_pretty(&info)?)?;
                 let r = cloud.put(&format!("{name}/info.json"), &tmp);
@@ -651,6 +719,19 @@ pub fn back_up(store: &Store, place: &Place) -> Result<i64> {
     })();
     let _ = fs::remove_file(&snapshot);
     result.map(|_| seq)
+}
+
+/// The latest Timeline entry in a copy of the history: its number and fingerprint (0 and
+/// empty when it has none).
+fn latest_in(db: &Path) -> Result<(i64, String)> {
+    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("reading the copy of the history")?;
+    let latest: Option<(i64, Vec<u8>)> = rusqlite::OptionalExtension::optional(conn.query_row(
+        "SELECT seq, hash FROM timeline ORDER BY seq DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ))?;
+    Ok(latest.map(|(seq, h)| (seq, crate::hash::hex(&h))).unwrap_or_default())
 }
 
 /// Copies a file into `dir` (an open folder) as `name`, through a temporary file, so the
@@ -852,9 +933,9 @@ pub fn run_auto(root: &Path) -> Result<()> {
                 if wait > 0 {
                     std::thread::sleep(Duration::from_millis(wait as u64));
                 }
-                let store = Store::open_at(root)?;
+                let mut store = Store::open_at(root)?;
                 let mut failed = back_up_all(&store).iter().any(|(_, r)| r.is_err());
-                failed |= crate::hub::sync_and_record(&store).is_some_and(|r| r.is_err());
+                failed |= crate::hub::sync_and_record(&mut store).is_some_and(|r| r.is_err());
                 if failed {
                     break; // try again on the next change, not in a tight loop
                 }

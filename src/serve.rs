@@ -19,6 +19,7 @@
 //!   POST /ui/backup/link   {place}      → back up to a place (person only)
 //!   POST /ui/backup/unlink {place}      → stop backing up there (person only)
 //!   POST /ui/backup/pick                → the Mac's folder picker (person only)
+//!   POST /ui/hub/unlink                 → stop sharing this project with the Hub (person only)
 //!
 //! Any route takes `?project=<id>` to act on another known project (person only).
 //!
@@ -384,7 +385,9 @@ fn route(root: &Path, actor: &str, person_secret: Option<&str>, token: &str, req
                 .into_iter()
                 .map(|(name, path)| json!({ "name": name, "path": path.display().to_string() }))
                 .collect();
-            (200, json!({ "linked": linked, "found": found }))
+            // Where the project is shared, if it is (as `asqu status` says it).
+            let hub = crate::hub::status_line(root);
+            (200, json!({ "linked": linked, "found": found, "hub": hub }))
         }
         (Method::Post, p) if p.starts_with("/ui/") && !is_person(request, person_secret) => {
             (403, json!({ "error": "only the person can do this, in the Asqu view (asqu open)" }))
@@ -403,6 +406,11 @@ fn route(root: &Path, actor: &str, person_secret: Option<&str>, token: &str, req
                 Err(e) => (400, json!({ "error": format!("{e:#}") })),
             }
         }
+        (Method::Post, "/ui/hub/unlink") => match crate::hub::unlink(root) {
+            Ok(true) => (200, json!({ "unlinked": true })),
+            Ok(false) => (400, json!({ "error": "this project isn't shared with a Hub" })),
+            Err(e) => (400, json!({ "error": format!("{e:#}") })),
+        },
         (Method::Post, "/ui/backup/unlink") => {
             let args = match read_json(request) {
                 Ok(a) => a,

@@ -66,7 +66,7 @@ fn clear_messages_when_nothing_matches() {
 #[test]
 fn shell_scripts_are_plain_ascii() {
     let root = env!("CARGO_MANIFEST_DIR");
-    for s in ["install.sh", "demo.sh", "scripts/release.sh", "scripts/brew-formula.sh"] {
+    for s in ["install.sh", "demo.sh", "scripts/release.sh", "scripts/brew-formula.sh", "scripts/brew.sh"] {
         let text = fs::read(format!("{root}/{s}")).unwrap();
         let bad: Vec<usize> = text.iter().enumerate().filter(|(_, b)| **b > 0x7f).map(|(i, _)| i).collect();
         assert!(bad.is_empty(), "{s} has non-ASCII bytes at {bad:?}");
@@ -411,4 +411,140 @@ fn histories_moved_aside_never_land_on_each_other() {
         });
         assert!(mine.is_some(), "project {i}'s history survived");
     }
+}
+
+#[test]
+fn setup_list_and_ai_tools_that_only_look_never_start_a_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("app.js"), "v1").unwrap();
+
+    let (ok, out) = asqu(root, &["setup", "--list"]);
+    assert!(ok && out.contains("AI tools Asqu can set up"), "{out}");
+    // AI tools that only look at, or change, a history that is already there.
+    for tool in ["asqu_show", "asqu_undo", "asqu_back", "asqu_try_compare", "asqu_try_keep", "asqu_mark", "asqu_made_up"] {
+        let (ok, out) = asqu(root, &["call", tool, "{}"]);
+        assert!(!ok, "{tool}: {out}");
+        assert!(!root.join(".asqu").exists(), "{tool} started a history");
+    }
+    let (_, out) = asqu(root, &["call", "asqu_show", "{}"]);
+    assert!(out.contains("No history here yet"), "{out}");
+
+    // Saving is what starts one.
+    let (ok, out) = asqu(root, &["call", "asqu_save", "{\"why\":\"Start\"}"]);
+    assert!(ok && root.join(".asqu/store.db").is_file(), "{out}");
+}
+
+#[test]
+fn only_the_person_keeps_a_try_without_its_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("app.js"), "v1").unwrap();
+    fs::write(root.join("asqu.toml"), "check = \"exit 1\"\n").unwrap();
+    asqu(root, &["save", "-w", "Start"]);
+    asqu(root, &["try", "start", "quick"]);
+    fs::write(root.join(".asqu/tries/quick/app.js"), "v2").unwrap();
+
+    // An AI or a script (no terminal) can't skip the project's check.
+    let (ok, out) = asqu(root, &["try", "keep", "quick", "--no-check"]);
+    assert!(!ok && out.contains("only the person"), "{out}");
+    assert_eq!(fs::read_to_string(root.join("app.js")).unwrap(), "v1");
+
+    let by_person = Command::new(env!("CARGO_BIN_EXE_asqu"))
+        .args(["try", "keep", "quick", "--no-check"])
+        .current_dir(root)
+        .env("ASQU_TEST_PERSON", "1")
+        .output()
+        .unwrap();
+    assert!(by_person.status.success(), "{}", String::from_utf8_lossy(&by_person.stderr));
+    assert_eq!(fs::read_to_string(root.join("app.js")).unwrap(), "v2");
+
+    // With no check set up, there is nothing to skip and nothing to ask.
+    fs::write(root.join("asqu.toml"), "check = \"\"\n").unwrap();
+    asqu(root, &["try", "start", "plain"]);
+    fs::write(root.join(".asqu/tries/plain/app.js"), "v3").unwrap();
+    let (ok, out) = asqu(root, &["try", "keep", "plain", "--no-check"]);
+    assert!(ok, "{out}");
+}
+
+/// A settings file that is there but can't be read is never treated as "no settings".
+#[cfg(unix)]
+#[test]
+fn an_unreadable_settings_file_stops_the_command_rather_than_dropping_the_rules() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("app.js"), "v1").unwrap();
+    asqu(root, &["save", "-w", "Start"]);
+    fs::write(root.join("asqu.toml"), "check = \"exit 1\"\n").unwrap();
+    fs::set_permissions(root.join("asqu.toml"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(root.join("asqu.toml")).is_ok() {
+        return; // running as an administrator, who can read anything
+    }
+    let (ok, out) = asqu(root, &["check"]);
+    fs::set_permissions(root.join("asqu.toml"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!ok && out.contains("couldn't read asqu.toml"), "{out}");
+}
+
+#[test]
+fn a_project_is_scanned_whatever_its_own_folder_is_called() {
+    // Names Asqu leaves out inside a project (downloaded packages, a folder below one
+    // called `.asqu`) are fine as the project's own place.
+    for place in ["node_modules", ".asqu/work/site"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(place);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("app.js"), "v1").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("debug.log"), "noise").unwrap();
+        let (ok, out) = asqu(&root, &["save", "-w", "Start"]);
+        assert!(ok && out.contains("2 added"), "{place}: {out}");
+    }
+}
+
+/// A folder this person may not look inside doesn't stop saves, and its files aren't
+/// recorded as removed.
+#[cfg(unix)]
+#[test]
+fn a_folder_that_cant_be_read_doesnt_stop_saves() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("private")).unwrap();
+    fs::write(root.join("private/keys.txt"), "k").unwrap();
+    fs::write(root.join("app.js"), "v1").unwrap();
+    asqu(root, &["save", "-w", "Start"]);
+
+    fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(root.join("private")).is_ok() {
+        fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
+        return; // running as an administrator, who can read anything
+    }
+    fs::write(root.join("app.js"), "v2").unwrap();
+    let (ok, out) = asqu(root, &["save", "-w", "Edit"]);
+    fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(ok, "{out}");
+    assert!(out.contains("0 added, 1 changed, 0 removed"), "{out}");
+    assert!(out.contains("couldn't look inside the folder private") && out.contains("stay as last saved"), "{out}");
+    // Readable again: nothing to save, the file never left the history.
+    let (_, out) = asqu(root, &["save"]);
+    assert!(out.contains("Nothing changed"), "{out}");
+}
+
+#[test]
+fn a_save_inside_a_try_records_which_ai_made_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("app.js"), "v1").unwrap();
+    asqu(root, &["save", "-w", "Start"]);
+    asqu(root, &["try", "start", "idea"]);
+    let folder = root.join(".asqu/tries/idea");
+    fs::write(folder.join("app.js"), "v2").unwrap();
+    let (ok, out) = asqu(&folder, &["save", "-w", "Try it", "--agent", "Some AI"]);
+    assert!(ok && out.contains("Saved Try \"idea\""), "{out}");
+    let conn = rusqlite::Connection::open(root.join(".asqu/store.db")).unwrap();
+    let agents: i64 = conn
+        .query_row("SELECT COUNT(*) FROM edits e JOIN why w ON w.id = e.why_id WHERE e.try_id = 'idea' AND w.agent = 'Some AI'", [], |r| r.get(0))
+        .unwrap();
+    assert!(agents > 0, "the Try's save says which AI made it");
 }

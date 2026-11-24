@@ -77,6 +77,67 @@ fn folder_backup_and_restore_on_another_computer() {
     assert!(ok(asqu(&new_same, &home, &["verify"])).contains("History is intact"));
 }
 
+/// Big files are copied before the history that points to them, and `info.json` says what
+/// the copied history holds: a backup stopped part-way leaves the one already there whole.
+#[cfg(unix)]
+#[test]
+fn a_backup_stopped_part_way_leaves_the_earlier_backup_whole() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let p = project(t.path());
+    let place = t.path().join("disk");
+    ok(asqu(&p, &home, &["save", "-w", "First version"]));
+    ok(asqu(&p, &home, &["link", place.to_str().unwrap()]));
+    let backup = fs::read_dir(&place).unwrap().next().unwrap().unwrap().path();
+    let before = fs::read(backup.join("store.db")).unwrap();
+    let info: serde_json::Value = serde_json::from_str(&fs::read_to_string(backup.join("info.json")).unwrap()).unwrap();
+    assert_eq!(info["seq"], 1);
+
+    // A new big file, and the place stops taking big files (a full or failing disk).
+    fs::write(p.join("big2.bin"), vec![9u8; 1_500_000]).unwrap();
+    ok(asqu(&p, &home, &["save", "-w", "Second big file"]));
+    fs::set_permissions(backup.join("large"), fs::Permissions::from_mode(0o555)).unwrap();
+    let out = asqu(&p, &home, &["backup"]);
+    fs::set_permissions(backup.join("large"), fs::Permissions::from_mode(0o755)).unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("failed") || !out.status.success(), "{text}");
+    assert_eq!(fs::read(backup.join("store.db")).unwrap(), before, "the earlier backup's history is untouched");
+
+    // Once the place works again, the backup completes and says what it holds.
+    ok(asqu(&p, &home, &["backup"]));
+    let info: serde_json::Value = serde_json::from_str(&fs::read_to_string(backup.join("info.json")).unwrap()).unwrap();
+    assert_eq!(info["seq"], 2);
+    assert_eq!(fs::read_dir(backup.join("large")).unwrap().count(), 2);
+}
+
+#[test]
+fn a_damaged_list_of_backup_places_is_set_aside_not_lost_or_left_to_the_person() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let p = project(t.path());
+    ok(asqu(&p, &home, &["save", "-w", "First version"]));
+    ok(asqu(&p, &home, &["link", t.path().join("disk").to_str().unwrap()]));
+
+    // Half-written, or opened in an editor at the wrong moment.
+    let damaged = "{ \"everywhere\": [ { \"folder\": \"/Volumes/Other\" }";
+    fs::write(home.join("backups.json"), damaged).unwrap();
+    // Nobody has to repair it by hand: Asqu keeps it under another name, says so in plain
+    // words, and carries on with a fresh one.
+    let text = ok(asqu(&p, &home, &["link", t.path().join("second").to_str().unwrap()]));
+    assert!(text.contains("started a fresh one") && text.contains("need choosing again"), "{text}");
+    let kept: Vec<_> = fs::read_dir(&home)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("backups.json.damaged-"))
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(fs::read_to_string(&kept[0]).unwrap(), damaged, "kept exactly as it was");
+    assert!(fs::read_to_string(home.join("backups.json")).unwrap().contains("second"));
+    // No stray temporary files left beside it.
+    assert!(!fs::read_dir(&home).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+}
+
 #[test]
 fn open_tries_in_a_backup_are_set_aside_until_the_person_brings_them_back() {
     // Tries aren't covered by the signed history, so a changed backup could slip one in.

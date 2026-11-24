@@ -10,7 +10,7 @@ use crate::hash::{self, Hash};
 use crate::{describe, scan};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -138,6 +138,8 @@ pub struct Store {
     skipped_large: std::cell::RefCell<Vec<String>>,
     /// Files another program had locked, already mentioned in this run.
     told_locked: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Files held back from the Hub by writes in this run (see `apply`), not yet said.
+    newly_held: std::cell::RefCell<Vec<String>>,
 }
 
 impl Store {
@@ -301,7 +303,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
-        let store = Store { root, conn, identity: None, skipped_large: Default::default(), told_locked: Default::default() };
+        let store = Store { root, conn, identity: None, skipped_large: Default::default(), told_locked: Default::default(), newly_held: Default::default() };
         store.migrate()?;
         Ok(store)
     }
@@ -847,18 +849,35 @@ impl Store {
 
         let cfg = crate::config::load(&self.root)?;
         // The size limit is only for files that were never saved: a file already in the
-        // history stays recorded however big it gets, so its changes can always be undone.
+        // history (the project's, or this Try's own saves) stays recorded however big it
+        // gets, so its changes can always be undone and it is never left out of a keep.
         let head = self.head_manifest()?;
         let mut skipped = Vec::new();
         let mut m = Manifest::new();
-        for (rel, abs) in scan::walk(dir)? {
+        let (found, unreadable) = scan::walk_noting_unreadable(dir)?;
+        // A folder this person may not look inside is no reason to stop every save, and
+        // never a sign its files are gone: they stay as they were last saved.
+        for folder in &unreadable {
+            let inside = format!("{folder}/");
+            let kept: Vec<(String, FileRef)> =
+                last_saved.unwrap_or(&head).iter().filter(|(rel, _)| rel.starts_with(&inside)).map(|(rel, f)| (rel.clone(), *f)).collect();
+            if self.told_locked.borrow_mut().insert(inside.clone()) {
+                eprintln!(
+                    "asqu: couldn't look inside the folder {} (no permission). {}",
+                    crate::describe::printable(folder),
+                    if kept.is_empty() { "Nothing in it is recorded." } else { "Its files stay as last saved." }
+                );
+            }
+            m.extend(kept);
+        }
+        for (rel, abs) in found {
             let meta = match fs::metadata(&abs) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // removed mid-scan
                 Err(e) => return Err(e.into()),
             };
             // Huge files (videos and the like) don't belong in the history.
-            if cfg.too_big(&rel, meta.len()) && !head.contains_key(&rel) {
+            if cfg.too_big(&rel, meta.len()) && !head.contains_key(&rel) && !last_saved.is_some_and(|m| m.contains_key(&rel)) {
                 skipped.push(rel);
                 continue;
             }
@@ -954,6 +973,18 @@ impl Store {
     }
 
     /// Total lines added and removed across the edited text files.
+    /// Like `line_totals`, also counting every line of the files a change adds: used to
+    /// judge how big a change is (a long new file is not a small change).
+    pub(crate) fn line_totals_with_added(&self, old: &Manifest, new: &Manifest, changes: &Changes) -> Result<Option<describe::LineCounts>> {
+        let mut lines = self.line_totals(old, new, changes)?;
+        for path in &changes.added {
+            if let Some(c) = describe::line_counts(&[], &self.get_blob(&new[path].hash)?) {
+                lines.get_or_insert_with(Default::default).added += c.added;
+            }
+        }
+        Ok(lines)
+    }
+
     pub(crate) fn line_totals(&self, old: &Manifest, new: &Manifest, changes: &Changes) -> Result<Option<describe::LineCounts>> {
         let mut lines: Option<describe::LineCounts> = None;
         for path in &changes.modified {
@@ -1088,10 +1119,26 @@ impl Store {
     /// Returns `None` when nothing changed. Safe to call from several processes at once
     /// (the watcher and the AI hook): saves take turns.
     pub fn save(&mut self, why: &Why) -> Result<Option<SaveReport>> {
-        let ts = chrono::Utc::now().timestamp();
+        self.save_at(why, None)
+    }
+
+    /// Like `save`, dated `when` (seconds) rather than now: work brought in from the Hub
+    /// keeps the time it was made there. The date is kept between the entry before and
+    /// now, so the history always runs forward and "go back to Tuesday" stays right.
+    pub fn save_at(&mut self, why: &Why, when: Option<i64>) -> Result<Option<SaveReport>> {
+        // Work from the Hub being written into the folder is saved by whoever writes it.
+        crate::hub::wait_while_receiving(&self.root);
+        let now = chrono::Utc::now().timestamp();
         self.identity(); // load (or create) the signing key before taking the lock
         // Take the write lock first, so two saves can't both build on the same head.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let ts = match when {
+            None => now,
+            Some(t) => {
+                let last: i64 = tx.query_row("SELECT COALESCE(MAX(ts), 0) FROM timeline", [], |r| r.get(0))?;
+                t.min(now).max(last.min(now))
+            }
+        };
         let prev = self.head()?;
         let old = match &prev {
             Some((_, _, m)) => Self::decode_manifest(&self.get_blob(m)?)?,
@@ -1345,6 +1392,27 @@ impl Store {
     /// Makes the files in `dir` match `want` for the paths listed in `changes`
     /// (added/modified are written, deleted are removed).
     pub(crate) fn apply(&self, dir: &Path, changes: &Changes, want: &Manifest) -> Result<()> {
+        // Every write into a project shared on the Hub that touches an ignore-rule file
+        // (from the Hub, a kept Try, undo or going back) is checked: files the new rules
+        // stop ignoring (`.env`, keys) are held back, never saved or sent.
+        let rules_change = dir == self.root
+            && changes.added.iter().chain(&changes.modified).chain(&changes.deleted).any(|p| scan::is_rule_file(p))
+            && crate::hub::link(&self.root).is_some();
+        let ignored_before = if rules_change { scan::walk_ignored(dir)? } else { Vec::new() };
+        self.write_changes(dir, changes, want)?;
+        if !ignored_before.is_empty() {
+            let held = scan::hold_back_freed(dir, ignored_before, want)?;
+            self.newly_held.borrow_mut().extend(held);
+        }
+        Ok(())
+    }
+
+    /// Files this run's writes held back from the Hub (each said once).
+    pub fn take_newly_held(&self) -> Vec<String> {
+        std::mem::take(&mut *self.newly_held.borrow_mut())
+    }
+
+    fn write_changes(&self, dir: &Path, changes: &Changes, want: &Manifest) -> Result<()> {
         refuse_linked_folder(dir)?;
         // Never overwrite or remove a big file that's left out of the history (one the
         // latest entry doesn't hold): its current version would be lost.
@@ -1474,6 +1542,35 @@ impl Store {
             // Read back exactly as a restore would (undoing compression and differences).
             if !self.get_blob(&h).is_ok_and(|data| hash::of(&data) == h) {
                 problems.push(format!("stored content {} is damaged", hash::short(&h)));
+            }
+        }
+        // Every Timeline entry: the list of its files, and each file in it, must still be
+        // stored (an entry can be whole in the chain above and still point at nothing).
+        {
+            let stored: HashSet<Vec<u8>> = {
+                let mut stmt = self.conn.prepare("SELECT hash FROM blobs")?;
+                let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                rows
+            };
+            let mut stmt = self.conn.prepare("SELECT seq, manifest FROM timeline ORDER BY seq")?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            // Most entries share most files: each list is only looked into once.
+            let mut whole: HashMap<Vec<u8>, bool> = HashMap::new();
+            for (seq, manifest) in rows {
+                let ok = match whole.get(&manifest) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = stored.contains(&manifest)
+                            && hash::from_slice(&manifest)
+                                .and_then(|h| self.manifest_from_hash(&h).ok())
+                                .is_some_and(|m| m.values().all(|f| stored.contains(&f.hash[..])));
+                        whole.insert(manifest, ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    problems.push(format!("entry {seq}: some of its files are missing from the history"));
+                }
             }
         }
         // Open Tries: the files each holds, and where it started, must still be stored.

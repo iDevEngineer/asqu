@@ -70,4 +70,22 @@ fn only_the_person_can_choose_a_backup_place_in_the_view() {
     assert_eq!(http(addr, "POST", "/ui/backup/unlink", &api, &stop).0, 403);
     assert_eq!(http(addr, "POST", "/ui/backup/unlink", &person, &stop).0, 200);
     assert!(http(addr, "GET", "/backups", &api, "").1.contains("\"linked\": []"));
+
+    // A project shared on a Hub says so in the view, and only the person can stop that
+    // (no terminal needed).
+    assert!(http(addr, "GET", "/backups", &api, "").1.contains("\"hub\": null"));
+    let links = t.path().join("home/hub-links.json");
+    let link = serde_json::json!({ root.canonicalize().unwrap().display().to_string(): {
+        "hub": "https://hub.example", "project_id": "p1", "project_name": "Shop", "label": "this Mac",
+        "token": "secret-key", "permissions": ["read", "write"] } });
+    fs::write(&links, link.to_string()).unwrap();
+    let (_, text) = http(addr, "GET", "/backups", &api, "");
+    assert!(text.contains("the Hub at hub.example") && !text.contains("secret-key"), "{text}");
+    assert_eq!(http(addr, "POST", "/ui/hub/unlink", &api, "{}").0, 403);
+    assert!(fs::read_to_string(&links).unwrap().contains("secret-key"), "still shared");
+    let (code, text) = http(addr, "POST", "/ui/hub/unlink", &person, "{}");
+    assert_eq!(code, 200, "{text}");
+    assert!(!fs::read_to_string(&links).unwrap().contains("secret-key"));
+    assert!(http(addr, "GET", "/backups", &api, "").1.contains("\"hub\": null"));
+    assert_eq!(http(addr, "POST", "/ui/hub/unlink", &person, "{}").0, 400, "nothing left to stop");
 }

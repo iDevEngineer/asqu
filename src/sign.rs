@@ -79,7 +79,7 @@ pub fn fingerprint(public: &[u8]) -> String {
 }
 
 fn decode_hex(s: &str) -> Result<[u8; 32]> {
-    if s.len() != 64 {
+    if s.len() != 64 || !s.is_ascii() {
         bail!("expected 64 hex characters");
     }
     let mut out = [0u8; 32];
@@ -121,4 +121,20 @@ fn write_private(path: &std::path::Path, text: &str) -> Result<()> {
     let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     f.write_all(text.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_hex;
+
+    #[test]
+    fn a_damaged_key_is_an_error_never_a_crash() {
+        assert!(decode_hex(&"ab".repeat(32)).is_ok());
+        assert!(decode_hex("abc").is_err());
+        assert!(decode_hex(&"zz".repeat(32)).is_err());
+        // 64 bytes, but not 64 plain characters: slicing it in pairs would crash.
+        let odd = format!("a{}", "é".repeat(31)) + "a";
+        assert_eq!(odd.len(), 64);
+        assert!(decode_hex(&odd).is_err());
+    }
 }

@@ -138,3 +138,13 @@ fn names_are_checked_and_never_compared_twice() {
     let root = store.root().to_path_buf();
     assert!(asqu::tools::call(&root, "asqu_try_compare", &serde_json::json!({ "names": "one" }), "an-ai").is_err());
 }
+
+#[test]
+fn an_ai_tool_finds_a_try_whatever_the_capitals() {
+    let (_dir, mut store) = setup();
+    store.start_try("Blue-Header", "", "me").unwrap();
+    let v = asqu::tools::call(store.root(), "asqu_try_toss", &serde_json::json!({ "name": "blue-header" }), "an-ai").unwrap();
+    assert_eq!(v["tossed"], "Blue-Header");
+    let v = asqu::tools::call(store.root(), "asqu_try_reopen", &serde_json::json!({ "name": "BLUE-HEADER" }), "an-ai").unwrap();
+    assert_eq!(v["reopened"], "Blue-Header");
+}

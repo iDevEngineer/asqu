@@ -54,7 +54,8 @@ pub fn name(root: &Path) -> String {
 pub fn remember(root: &Path) {
     let _ = (|| -> Result<()> {
         let path = list_file().ok_or_else(|| anyhow::anyhow!("no home"))?;
-        let mut all = read();
+        // (Left alone when it can't be read just now: never rewritten as if empty.)
+        let mut all = crate::backup::read_json_for_change(&path, "")?;
         let key = root.display().to_string();
         let now = now_ms();
         if all[&key].as_i64().is_some_and(|t| now - t < REFRESH_MS) {
