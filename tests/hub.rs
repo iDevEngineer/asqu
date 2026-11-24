@@ -1134,7 +1134,9 @@ fn a_clash_shows_in_the_brief_with_the_commands_that_settle_it() {
     assert_eq!(c["file"], "index.html");
     assert_eq!(c["keep_this_computers"], "asqu try keep hub-2 --take main:index.html");
     assert_eq!(c["keep_the_hubs"], "asqu try keep hub-2 --take try:index.html");
-    assert!(c["hub"].as_str().unwrap().ends_with("hub-2/index.html"));
+    // A real path on this computer, so written with this system's own separators.
+    let hub_copy = Path::new(c["hub"].as_str().unwrap());
+    assert!(hub_copy.ends_with(Path::new("hub-2").join("index.html")), "{}", hub_copy.display());
 }
 
 #[test]
