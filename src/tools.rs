@@ -420,7 +420,7 @@ pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str
         )),
         "asqu_try_keep" => {
             use crate::tries::KeepOptions;
-            let name = s("name").context("\"name\" is required")?;
+            let name = store.try_named(&s("name").context("\"name\" is required")?)?;
             // An AI can never approve a high-risk keep for the person.
             let opts = KeepOptions {
                 prefer_try: args.get("prefer_try").and_then(Value::as_bool).unwrap_or(false),
@@ -430,12 +430,13 @@ pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str
             keep_json(&mut store, &name, opts, actor)
         }
         "asqu_try_reopen" => {
-            let name = s("name").context("\"name\" is required")?;
+            let name = store.try_named(&s("name").context("\"name\" is required")?)?;
             let dir = store.reopen_try(&name)?;
             Ok(json!({ "reopened": name, "folder": dir.display().to_string() }))
         }
         "asqu_try_compare" => {
-            let names = names_arg(args)?;
+            // (Like the command line: other capitals, or a worktree folder's name, find the Try.)
+            let names = names_arg(args)?.iter().map(|n| store.try_named(n)).collect::<Result<Vec<_>>>()?;
             let run_checks = args.get("run_checks").and_then(Value::as_bool).unwrap_or(true);
             // An AI can't allow a check command for the person.
             let mut v = store.compare_tries(&names, run_checks, None, actor)?.to_json();
@@ -443,13 +444,13 @@ pub fn call_from(root: &Path, from: &Path, name: &str, args: &Value, actor: &str
             Ok(v)
         }
         "asqu_try_toss" => {
-            let name = s("name").context("\"name\" is required")?;
+            let name = store.try_named(&s("name").context("\"name\" is required")?)?;
             store.toss_try(&name, actor)?;
             Ok(json!({ "tossed": name }))
         }
         "asqu_try_update" => {
             use crate::tries::UpdateOutcome;
-            let name = s("name").context("\"name\" is required")?;
+            let name = store.try_named(&s("name").context("\"name\" is required")?)?;
             Ok(match store.update_try(&name, &take_arg(args)?, dry, actor)? {
                 UpdateOutcome::UpToDate => json!({ "status": "up_to_date", "name": name,
                     "next": "Nothing to do: the Try already has everything in the main project." }),

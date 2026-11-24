@@ -296,3 +296,36 @@ fn links_cant_smuggle_anything_past_a_receipt() {
     fs::remove_file(root.join("node_modules")).unwrap();
     assert!(asqu(root, home.path(), &["verify", "--receipt"]).0);
 }
+
+/// Asqu doesn't save links, so a fresh copy never has them: said plainly, with what to do.
+#[cfg(unix)]
+#[test]
+fn a_link_that_stops_a_clean_receipt_is_explained() {
+    let (dir, home) = project();
+    let root = dir.path();
+    std::os::unix::fs::symlink("app.js", root.join("shortcut.js")).unwrap();
+    let (ok, out) = asqu(root, home.path(), &["check", "--clean", "--trust-check"]);
+    assert!(out.contains("No receipt was signed") && out.contains("not checked shortcut.js"), "{ok} {out}");
+    assert!(out.contains("shortcut.js is a link") && out.contains(".asquignore"), "{out}");
+    assert!(!out.contains(".git/info/exclude"), "not blamed on something else: {out}");
+
+    // Left out as it says: the receipt is signed.
+    fs::write(root.join(".asquignore"), "shortcut.js\n").unwrap();
+    let (_, out) = asqu(root, home.path(), &["check", "--clean"]);
+    assert!(out.contains("Signed a receipt"), "{out}");
+}
+
+#[test]
+fn allowing_a_check_counts_only_for_the_command_that_was_shown() {
+    let (dir, home) = project();
+    std::env::set_var("ASQU_HOME", home.path()); // the only test here that uses Asqu in-process
+    let mut store = asqu::Store::open_or_create(dir.path()).unwrap();
+    use asqu::receipt::CheckOutcome;
+    // Allowed for a command that is no longer the project's check: asked again, nothing run.
+    match store.check_now(false, Some("some other command"), "t").unwrap() {
+        CheckOutcome::NeedsTrust { command } => assert_eq!(command, CHECK),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(store.check_now(false, None, "t").unwrap(), CheckOutcome::NeedsTrust { .. }));
+    assert!(matches!(store.check_now(false, Some(CHECK), "t").unwrap(), CheckOutcome::Passed { .. }));
+}

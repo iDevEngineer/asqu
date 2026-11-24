@@ -485,3 +485,66 @@ fn an_unreadable_settings_file_stops_the_command_rather_than_dropping_the_rules(
     fs::set_permissions(root.join("asqu.toml"), fs::Permissions::from_mode(0o644)).unwrap();
     assert!(!ok && out.contains("couldn't read asqu.toml"), "{out}");
 }
+
+#[test]
+fn a_project_is_scanned_whatever_its_own_folder_is_called() {
+    // Names Asqu leaves out inside a project (downloaded packages, a folder below one
+    // called `.asqu`) are fine as the project's own place.
+    for place in ["node_modules", ".asqu/work/site"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(place);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("app.js"), "v1").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("debug.log"), "noise").unwrap();
+        let (ok, out) = asqu(&root, &["save", "-w", "Start"]);
+        assert!(ok && out.contains("2 added"), "{place}: {out}");
+    }
+}
+
+/// A folder this person may not look inside doesn't stop saves, and its files aren't
+/// recorded as removed.
+#[cfg(unix)]
+#[test]
+fn a_folder_that_cant_be_read_doesnt_stop_saves() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("private")).unwrap();
+    fs::write(root.join("private/keys.txt"), "k").unwrap();
+    fs::write(root.join("app.js"), "v1").unwrap();
+    asqu(root, &["save", "-w", "Start"]);
+
+    fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(root.join("private")).is_ok() {
+        fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
+        return; // running as an administrator, who can read anything
+    }
+    fs::write(root.join("app.js"), "v2").unwrap();
+    let (ok, out) = asqu(root, &["save", "-w", "Edit"]);
+    fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(ok, "{out}");
+    assert!(out.contains("0 added, 1 changed, 0 removed"), "{out}");
+    assert!(out.contains("couldn't look inside the folder private") && out.contains("stay as last saved"), "{out}");
+    // Readable again: nothing to save, the file never left the history.
+    let (_, out) = asqu(root, &["save"]);
+    assert!(out.contains("Nothing changed"), "{out}");
+}
+
+#[test]
+fn a_save_inside_a_try_records_which_ai_made_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("app.js"), "v1").unwrap();
+    asqu(root, &["save", "-w", "Start"]);
+    asqu(root, &["try", "start", "idea"]);
+    let folder = root.join(".asqu/tries/idea");
+    fs::write(folder.join("app.js"), "v2").unwrap();
+    let (ok, out) = asqu(&folder, &["save", "-w", "Try it", "--agent", "Some AI"]);
+    assert!(ok && out.contains("Saved Try \"idea\""), "{out}");
+    let conn = rusqlite::Connection::open(root.join(".asqu/store.db")).unwrap();
+    let agents: i64 = conn
+        .query_row("SELECT COUNT(*) FROM edits e JOIN why w ON w.id = e.why_id WHERE e.try_id = 'idea' AND w.agent = 'Some AI'", [], |r| r.get(0))
+        .unwrap();
+    assert!(agents > 0, "the Try's save says which AI made it");
+}

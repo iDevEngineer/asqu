@@ -55,7 +55,14 @@ pub fn open_url(url: &str) {
         c.arg(url);
         c
     };
-    let _ = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // On Linux the opener can stay running for as long as the browser it started does:
+    // never wait for it there.
+    if cfg!(any(target_os = "macos", windows)) {
+        let _ = cmd.status();
+    } else {
+        let _ = cmd.stdin(std::process::Stdio::null()).spawn();
+    }
 }
 
 /// Lets a background process carry on on its own: not stopped by Ctrl+C in the

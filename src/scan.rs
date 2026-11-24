@@ -86,6 +86,11 @@ pub fn walk_ignored(root: &Path) -> Result<Vec<String>> {
 }
 
 fn keep_entry(e: &ignore::DirEntry) -> bool {
+    // The project's own folder is scanned whatever it is called (a project kept in a
+    // folder named `node_modules`, say): the names below are for what is inside it.
+    if e.depth() == 0 {
+        return true;
+    }
     // A folder that's a working copy of its own (a git worktree an AI tool made in
     // here, or a project nested inside this one) is a separate project.
     if e.depth() > 0 && e.file_type().is_some_and(|t| t.is_dir()) && crate::store::is_working_copy(e.path()) {
@@ -98,6 +103,29 @@ fn keep_entry(e: &ignore::DirEntry) -> bool {
 
 /// Returns `(relative path with '/' separators, absolute path)` for every tracked file, sorted.
 pub fn walk(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let (files, unreadable) = walk_noting_unreadable(root)?;
+    if let Some(folder) = unreadable.first() {
+        anyhow::bail!("couldn't read the folder {folder} (no permission)");
+    }
+    Ok(files)
+}
+
+/// The folder (relative, `/`-separated) a scan error is about, when the error is only
+/// that this person may not look inside it.
+fn unreadable_folder(root: &Path, e: &ignore::Error) -> Option<String> {
+    match e {
+        ignore::Error::WithDepth { err, .. } => unreadable_folder(root, err),
+        ignore::Error::WithPath { path, err } => {
+            let denied = err.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
+            relative(root, path).filter(|rel| denied && !rel.is_empty())
+        }
+        _ => None,
+    }
+}
+
+/// Like `walk`, but a folder this person may not look inside doesn't stop the scan: it is
+/// left out and returned in the second list, for the caller to keep as it was last saved.
+pub fn walk_noting_unreadable(root: &Path) -> Result<(Vec<(String, PathBuf)>, Vec<String>)> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -110,12 +138,15 @@ pub fn walk(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         .add_custom_ignore_filename(".asquignore");
     // A Try's folder lives inside `.asqu`, whose own ignore file hides everything from git.
     // Don't let that hide the Try's files: use the project's ignore rules instead.
+    // (Exactly `<project>/.asqu/tries/<name>`: a project kept somewhere below a folder
+    // that happens to be called `.asqu` is an ordinary project.)
     let parts: Vec<_> = root.components().collect();
-    let inside_asqu = parts.iter().any(|c| c.as_os_str() == crate::store::DIR);
+    let n = parts.len();
+    let try_of: Option<PathBuf> = (n >= 3 && parts[n - 3].as_os_str() == crate::store::DIR && parts[n - 2].as_os_str() == "tries")
+        .then(|| parts[..n - 3].iter().collect());
     // Files held back from the Hub are left out of the project's saves (not a Try's).
-    let held = if inside_asqu { Default::default() } else { held_back(root) };
-    if let Some(i) = parts.iter().position(|c| c.as_os_str() == crate::store::DIR) {
-        let project: PathBuf = parts[..i].iter().collect();
+    let held = if try_of.is_some() { Default::default() } else { held_back(root) };
+    if let Some(project) = try_of {
         builder.parents(false);
         for f in RULE_FILES {
             if project.join(f).is_file() {
@@ -129,8 +160,18 @@ pub fn walk(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     });
 
     let mut files = Vec::new();
+    let mut unreadable = Vec::new();
     for entry in builder.build() {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => match unreadable_folder(root, &e) {
+                Some(folder) => {
+                    unreadable.push(folder);
+                    continue;
+                }
+                None => return Err(e.into()),
+            },
+        };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -139,5 +180,7 @@ pub fn walk(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         files.push((rel, abs));
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
+    unreadable.sort();
+    unreadable.dedup();
+    Ok((files, unreadable))
 }

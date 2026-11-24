@@ -81,6 +81,10 @@ fn covered_files(dir: &Path) -> Result<(Vec<(String, std::path::PathBuf)>, Vec<S
         .follow_links(false)
         .add_custom_ignore_filename(".asquignore")
         .filter_entry(move |e| {
+            // The folder itself is covered whatever it is called.
+            if e.depth() == 0 {
+                return true;
+            }
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
             let name = e.file_name().to_string_lossy().to_string();
             let note = |why: &str| {
@@ -210,6 +214,40 @@ pub(crate) struct Checked {
 }
 
 impl Checked {
+    /// Files there `now` that weren't among the ones checked.
+    fn not_checked<'a>(&self, now: &'a Checked) -> Vec<&'a String> {
+        now.each.keys().filter(|rel| !self.each.contains_key(*rel)).collect()
+    }
+
+    /// Why the files there `now` aren't exactly the ones checked, when Asqu can tell: said
+    /// so the person knows what to do, without having to work it out.
+    fn why_different(&self, now: &Checked, root: &Path) -> String {
+        let extra = self.not_checked(now);
+        let links: Vec<&str> = extra.iter().filter(|rel| now.each[**rel].0).map(|rel| rel.as_str()).collect();
+        if let Some(link) = links.first() {
+            return format!(
+                "{link} is a link to another file or folder. Asqu doesn't save links, so the fresh copy \
+                 that was checked didn't have it. Replace the link with a real file, or leave it out with \
+                 a line in .asquignore"
+            );
+        }
+        let cfg = crate::config::load(root).ok();
+        let big = extra.iter().find(|rel| {
+            fs::metadata(root.join(rel.as_str())).is_ok_and(|m| cfg.as_ref().is_some_and(|c| c.too_big(rel, m.len())))
+        });
+        if let Some(big) = big {
+            return format!(
+                "{big} is a big file left out of the history, so the fresh copy that was checked didn't \
+                 have it. Leave it out with a line in .asquignore, or keep big files like it with \
+                 `include` in asqu.toml"
+            );
+        }
+        "They changed while the check ran, or aren't saved in the history: a file hidden only by a rule from \
+         outside the project (such as .git/info/exclude) is left out of the history but not out of a \
+         receipt, so add it to the project's .gitignore or .asquignore"
+            .to_string()
+    }
+
     pub(crate) fn of(dir: &Path) -> Result<Checked> {
         let (each, _) = each_file(dir)?;
         let (files, count) = combine(&each);
@@ -228,7 +266,7 @@ impl Checked {
                 _ => {}
             }
         }
-        for rel in now.each.keys().filter(|rel| !self.each.contains_key(*rel)) {
+        for rel in self.not_checked(now) {
             found.push(format!("not checked {rel}"));
         }
         let more = found.len().saturating_sub(SHOWN);
@@ -408,11 +446,9 @@ pub(crate) fn issue(root: &Path, checked: Checked, check: &str, clean: bool) -> 
         Ok(now) if now.files == checked.files => {}
         Ok(now) => {
             return Err(format!(
-                "the project's files aren't exactly the ones that were checked ({}). They changed while \
-                 the check ran, or aren't saved in the history: a file hidden only by a rule from \
-                 outside the project (such as .git/info/exclude) is left out of the history but \
-                 not out of a receipt, so add it to the project's .gitignore or .asquignore",
-                checked.differences(&now)
+                "the project's files aren't exactly the ones that were checked ({}). {}",
+                checked.differences(&now),
+                checked.why_different(&now, root)
             ))
         }
         Err(e) => return Err(format!("{e:#}")),
@@ -453,15 +489,16 @@ impl Store {
 
     /// Runs the project's check on the files as they are now and, if it passes, signs a
     /// receipt for them. `clean` runs it in a fresh copy (also when the project asks for
-    /// that). `trust_check` means the person has just allowed the command.
-    pub fn check_now(&mut self, clean: bool, trust_check: bool, actor: &str) -> Result<CheckOutcome> {
+    /// that). `trust_check` is the command the person has just been shown and allowed.
+    pub fn check_now(&mut self, clean: bool, trust_check: Option<&str>, actor: &str) -> Result<CheckOutcome> {
         self.save(&Why { actor: actor.into(), ..Default::default() })?;
         let cfg = crate::config::load(self.root())?;
         let clean = clean || cfg.clean;
         let Some(cmd) = cfg.check_command(clean) else { return Ok(CheckOutcome::NoCheck) };
         if !crate::trust::check_is_trusted(self.root(), &cmd) {
             // A command with hidden characters can't be shown honestly, so it's never allowed.
-            if !trust_check || cmd.chars().any(crate::describe::is_hidden) {
+            // Only the exact command the person was shown: if asqu.toml changed since, ask again.
+            if trust_check != Some(cmd.as_str()) || cmd.chars().any(crate::describe::is_hidden) {
                 return Ok(CheckOutcome::NeedsTrust { command: cmd });
             }
             if let Err(e) = crate::trust::trust_check(self.root(), &cmd) {

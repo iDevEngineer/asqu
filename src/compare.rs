@@ -31,9 +31,17 @@ pub struct TryReport {
     diff: String,
 }
 
+/// How a check note starts when the check was meant to run and couldn't.
+const COULD_NOT_RUN: &str = "Check couldn't run";
+
 impl TryReport {
     fn line_total(&self) -> usize {
         self.lines.map_or(0, |l| l.added + l.removed)
+    }
+
+    /// Was this Try's check meant to run, and couldn't (its folder is gone, it crashed)?
+    fn check_could_not_run(&self) -> bool {
+        self.check.is_none() && self.check_note.as_deref().is_some_and(|n| n.starts_with(COULD_NOT_RUN))
     }
 
     /// Lower is better: Tries that changed something, a passing check first, then combining
@@ -41,6 +49,8 @@ impl TryReport {
     fn rank(&self) -> (bool, u8, bool, u8, usize, usize) {
         let check = match &self.check {
             Some(c) if c.passed => 0,
+            // A check that couldn't run is no better than one that failed.
+            None if self.check_could_not_run() => 2,
             None => 1,
             Some(_) => 2,
         };
@@ -129,7 +139,7 @@ impl Store {
             let base = self.base_of(&row)?;
             let theirs = self.manifest_from_hash(&row.manifest)?;
             let changes = Store::diff(&base, &theirs);
-            let lines = self.line_totals(&base, &theirs, &changes)?;
+            let lines = self.line_totals_with_added(&base, &theirs, &changes)?;
             let (_, clashes) = self.combine(&base, &ours, &theirs, false, &Default::default())?;
             let mut diff = String::new();
             for path in changes.added.iter().chain(&changes.modified).chain(&changes.deleted) {
@@ -198,7 +208,7 @@ impl Store {
                     for (r, result) in reports.iter_mut().zip(results) {
                         match result {
                             Ok(c) => r.check = Some(c),
-                            Err(e) => r.check_note = Some(format!("Check couldn't run: {e:#}")),
+                            Err(e) => r.check_note = Some(format!("{COULD_NOT_RUN}: {e:#}")),
                         }
                     }
                 }
@@ -212,6 +222,10 @@ impl Store {
             None => (None, Some("none of these Tries has changed anything yet".to_string())),
             Some(r) if r.check.as_ref().is_some_and(|c| !c.passed) => {
                 (None, Some(if reports.len() == 1 { "its check failed" } else { "none of them passed its check" }.to_string()))
+            }
+            // Never suggested unchecked when a check was meant to run.
+            Some(r) if r.check_could_not_run() => {
+                (None, Some(if reports.len() == 1 { "its check couldn't run" } else { "none of them passed its check" }.to_string()))
             }
             Some(r) => (Some((r.name.clone(), r.strengths())), None),
         };

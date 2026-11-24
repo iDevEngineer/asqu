@@ -854,7 +854,23 @@ impl Store {
         let head = self.head_manifest()?;
         let mut skipped = Vec::new();
         let mut m = Manifest::new();
-        for (rel, abs) in scan::walk(dir)? {
+        let (found, unreadable) = scan::walk_noting_unreadable(dir)?;
+        // A folder this person may not look inside is no reason to stop every save, and
+        // never a sign its files are gone: they stay as they were last saved.
+        for folder in &unreadable {
+            let inside = format!("{folder}/");
+            let kept: Vec<(String, FileRef)> =
+                last_saved.unwrap_or(&head).iter().filter(|(rel, _)| rel.starts_with(&inside)).map(|(rel, f)| (rel.clone(), *f)).collect();
+            if self.told_locked.borrow_mut().insert(inside.clone()) {
+                eprintln!(
+                    "asqu: couldn't look inside the folder {} (no permission). {}",
+                    crate::describe::printable(folder),
+                    if kept.is_empty() { "Nothing in it is recorded." } else { "Its files stay as last saved." }
+                );
+            }
+            m.extend(kept);
+        }
+        for (rel, abs) in found {
             let meta = match fs::metadata(&abs) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // removed mid-scan
@@ -957,6 +973,18 @@ impl Store {
     }
 
     /// Total lines added and removed across the edited text files.
+    /// Like `line_totals`, also counting every line of the files a change adds: used to
+    /// judge how big a change is (a long new file is not a small change).
+    pub(crate) fn line_totals_with_added(&self, old: &Manifest, new: &Manifest, changes: &Changes) -> Result<Option<describe::LineCounts>> {
+        let mut lines = self.line_totals(old, new, changes)?;
+        for path in &changes.added {
+            if let Some(c) = describe::line_counts(&[], &self.get_blob(&new[path].hash)?) {
+                lines.get_or_insert_with(Default::default).added += c.added;
+            }
+        }
+        Ok(lines)
+    }
+
     pub(crate) fn line_totals(&self, old: &Manifest, new: &Manifest, changes: &Changes) -> Result<Option<describe::LineCounts>> {
         let mut lines: Option<describe::LineCounts> = None;
         for path in &changes.modified {

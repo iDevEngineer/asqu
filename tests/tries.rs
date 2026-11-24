@@ -410,3 +410,39 @@ fn edits_made_in_the_main_project_while_the_check_runs_are_never_written_over() 
     assert_eq!(read(&dir.path().join("README.md")).trim(), "edited");
     assert!(store.verify().unwrap().is_empty());
 }
+
+#[test]
+fn a_long_new_file_is_not_a_small_change() {
+    let (_dir, mut store) = setup();
+    let t = store.start_try("notes", "", "t").unwrap();
+    fs::write(t.join("NOTES.md"), "a line\n".repeat(400)).unwrap();
+    match store.keep_try("notes", KeepOptions::default(), "t").unwrap() {
+        KeepOutcome::Kept { risk, .. } => assert_eq!(risk.level, asqu::risk::Level::Medium, "{:?}", risk.reasons),
+        other => panic!("{other:?}"),
+    }
+    // A short one still is.
+    let t = store.start_try("todo", "", "t").unwrap();
+    fs::write(t.join("TODO.md"), "one line\n").unwrap();
+    match store.keep_try("todo", KeepOptions::default(), "t").unwrap() {
+        KeepOutcome::Kept { risk, .. } => assert_eq!(risk.level, asqu::risk::Level::Low, "{:?}", risk.reasons),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// "Can be run" is combined like the text: the main project's change to it survives a
+/// keep that combines both sides' edits to the same file.
+#[cfg(unix)]
+#[test]
+fn combining_keeps_a_can_be_run_mark_set_in_the_main_project() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, mut store) = setup();
+    let t = store.start_try("edit", "", "t").unwrap();
+    fs::write(t.join("app.js"), "line1\nline2\nTRY\n").unwrap();
+    // Meanwhile, in the main project: another line changes and the file becomes runnable.
+    fs::write(dir.path().join("app.js"), "MAIN\nline2\nline3\n").unwrap();
+    fs::set_permissions(dir.path().join("app.js"), fs::Permissions::from_mode(0o755)).unwrap();
+    kept(store.keep_try("edit", KeepOptions::default(), "t").unwrap());
+    assert_eq!(read(&dir.path().join("app.js")), "MAIN\nline2\nTRY\n");
+    let mode = fs::metadata(dir.path().join("app.js")).unwrap().permissions().mode();
+    assert!(mode & 0o111 != 0, "still runnable: {mode:o}");
+}

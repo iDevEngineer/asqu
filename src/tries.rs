@@ -880,7 +880,7 @@ impl Store {
             opts.approve = false;
             opts.trust_check = false;
         }
-        let lines = self.line_totals(&ours, &merged, &changes)?;
+        let lines = self.line_totals_with_added(&ours, &merged, &changes)?;
         let risk = crate::decide::review_risk(risk::assess(&changes, lines, &cfg), &changes, &row.request);
         if changes.is_empty() {
             if Store::diff(&base, &theirs).is_empty() {
@@ -1095,7 +1095,8 @@ impl Store {
             } else {
                 match (b, o, t) {
                     (Some(b), Some(o), Some(t)) => match self.combine_text(b, o, t)? {
-                        Some(h) => Some(FileRef { hash: h, exec: t.exec }),
+                        // "Can be run" is combined like the text: a change to it on either side is kept.
+                        Some(h) => Some(FileRef { hash: h, exec: if t.exec != b.exec { t.exec } else { o.exec } }),
                         None => {
                             clashes.push(path.clone());
                             continue;

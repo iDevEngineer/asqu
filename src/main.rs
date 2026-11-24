@@ -535,14 +535,6 @@ fn remove_command(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    for (file, changed) in asqu::setup::remove(&root).unwrap_or_default() {
-        if changed {
-            println!("Removed Asqu's notes from {file}.");
-        }
-    }
-    for file in asqu::aitools::remove_all(&root).unwrap_or_default() {
-        println!("Removed Asqu's hooks from {}.", file.strip_prefix(&root).unwrap_or(&file).display());
-    }
     // Fold everything into the one history file before it is moved.
     if let Ok(conn) = rusqlite::Connection::open(dir.join("store.db")) {
         let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
@@ -570,6 +562,15 @@ fn remove_command(dry_run: bool) -> Result<()> {
             let _ = std::fs::rename(&staged, &dir);
             return Err(e.context("the history could not be moved, so it was left where it was"));
         }
+    }
+    // Only once the history has moved: if that failed, nothing at all was changed.
+    for (file, changed) in asqu::setup::remove(&root).unwrap_or_default() {
+        if changed {
+            println!("Removed Asqu's notes from {file}.");
+        }
+    }
+    for file in asqu::aitools::remove_all(&root).unwrap_or_default() {
+        println!("Removed Asqu's hooks from {}.", file.strip_prefix(&root).unwrap_or(&file).display());
     }
     println!("Done. Asqu's history for this folder is now in {}.", dest.display());
     Ok(())
@@ -1050,15 +1051,17 @@ fn try_command(store: &mut Store, cmd: TryCmd) -> Result<()> {
 /// Runs the check now and returns the signed receipt. Explains and stops if there isn't one.
 fn checked_receipt(store: &mut Store, clean: bool, trust_check: bool) -> Result<asqu::receipt::Receipt> {
     use asqu::receipt::CheckOutcome;
-    let mut allowed = false;
+    // The exact command the person allowed: if the project's check has changed by the
+    // time it runs, they are shown the new one and asked again.
+    let mut allowed: Option<String> = None;
     let outcome = loop {
-        match store.check_now(clean, allowed, &actor())? {
-            CheckOutcome::NeedsTrust { command } if trust_check && !allowed => {
+        match store.check_now(clean, allowed.as_deref(), &actor())? {
+            CheckOutcome::NeedsTrust { command } if trust_check && allowed.as_deref() != Some(command.as_str()) => {
                 if !confirm_check_command(&command)? {
                     println!("Not allowed. Nothing was run.");
                     std::process::exit(1);
                 }
-                allowed = true;
+                allowed = Some(command);
             }
             other => break other,
         }
@@ -2192,7 +2195,14 @@ fn main() -> Result<()> {
         }
         Command::Save { why, agent } => {
             if let Some(name) = store.try_for_path(&std::env::current_dir()?) {
-                return try_command(&mut store, TryCmd::Save { name: Some(name), why });
+                // Inside a Try's folder the save belongs to that Try, with who made it.
+                let c = store.save_try(&name, &Why { request: why, actor: actor(), agent, ..Default::default() })?;
+                if c.is_empty() {
+                    println!("Nothing changed in Try \"{name}\" since its last save.");
+                } else {
+                    println!("Saved Try \"{name}\": {}.", asqu::describe::summarize(&c, None));
+                }
+                return Ok(());
             }
             let why = Why { request: why, actor: actor(), agent, ..Default::default() };
             let saved = store.save(&why)?;
