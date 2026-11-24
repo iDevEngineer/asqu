@@ -616,6 +616,31 @@ impl Store {
         Ok(dir)
     }
 
+    /// Starts a Try holding `files`, counted as starting from `base` (not the latest entry):
+    /// used for the Hub's version of files that clashed, so keeping the Try later combines
+    /// from the version both sides last had. The main project is not changed.
+    pub(crate) fn start_try_with(&mut self, name: &str, request: &str, base: &Manifest, files: &Manifest) -> Result<PathBuf> {
+        valid_name(name)?;
+        if self.try_row(name).is_ok() {
+            bail!("a Try called \"{name}\" already exists; pick another name");
+        }
+        let base_seq = self.head_seq()?.unwrap_or(0);
+        let base_hash = self.put_blob_near(&self.conn, &Store::encode_manifest(base), None)?;
+        let manifest_hash = self.put_blob_near(&self.conn, &Store::encode_manifest(files), Some(&base_hash))?;
+        let dir = self.own_folder(name);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        fs::create_dir_all(&dir)?;
+        self.materialize(&dir, files)?;
+        link_packages(self.root(), &dir);
+        self.conn.execute(
+            "INSERT INTO tries (name, base_seq, created, status, request, manifest, base) VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6)",
+            params![name, base_seq, chrono::Utc::now().timestamp(), request, &manifest_hash[..], &base_hash[..]],
+        )?;
+        Ok(dir)
+    }
+
     /// Records what's in a Try's folder now. Returns what changed since its last save.
     ///
     /// A linked worktree whose folder is gone has nothing new to record: the Try stands as
@@ -804,7 +829,10 @@ impl Store {
         }
         let row = self.open_try(name)?;
         self.save_try(name, &who)?;
-        self.save(&who)?; // keep any unsaved work in the main project first
+        // Keep any unsaved work in the main project first. When this Try holds the Hub's
+        // side of a clash, that work is the clash being settled, and is labelled so.
+        let first = Why { request: crate::hub::settling_request(self, name).unwrap_or_default(), ..who.clone() };
+        self.save(&first)?;
         let row = Row { manifest: self.try_row(name)?.manifest, ..row };
         // A worktree whose folder is gone: kept from its last saved state.
         let folder_there = self.folder_ok(&row);

@@ -212,13 +212,19 @@ impl Store {
             Ok(rows.iter().filter_map(|h| hash::from_slice(h)).collect())
         };
         let mut keep: HashSet<Hash> = HashSet::new();
-        let manifests: HashSet<Hash> =
+        let mut manifests: HashSet<Hash> =
             column(
                 "SELECT manifest FROM timeline UNION SELECT manifest FROM tries
                  UNION SELECT base FROM tries WHERE base IS NOT NULL",
             )?
             .into_iter()
             .collect();
+        // What the Hub's latest shared version holds: the starting point for combining.
+        if let Some(h) = self.meta(crate::hub::BASE_META)?.as_deref().and_then(hex_hash) {
+            if self.conn.query_row("SELECT 1 FROM blobs WHERE hash = ?1", [&h[..]], |_| Ok(())).optional()?.is_some() {
+                manifests.insert(h);
+            }
+        }
         for m in &manifests {
             for f in self.manifest_from_hash(m)?.values() {
                 keep.insert(f.hash);

@@ -138,6 +138,8 @@ pub struct Store {
     skipped_large: std::cell::RefCell<Vec<String>>,
     /// Files another program had locked, already mentioned in this run.
     told_locked: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Files held back from the Hub by writes in this run (see `apply`), not yet said.
+    newly_held: std::cell::RefCell<Vec<String>>,
 }
 
 impl Store {
@@ -301,7 +303,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
-        let store = Store { root, conn, identity: None, skipped_large: Default::default(), told_locked: Default::default() };
+        let store = Store { root, conn, identity: None, skipped_large: Default::default(), told_locked: Default::default(), newly_held: Default::default() };
         store.migrate()?;
         Ok(store)
     }
@@ -1088,10 +1090,26 @@ impl Store {
     /// Returns `None` when nothing changed. Safe to call from several processes at once
     /// (the watcher and the AI hook): saves take turns.
     pub fn save(&mut self, why: &Why) -> Result<Option<SaveReport>> {
-        let ts = chrono::Utc::now().timestamp();
+        self.save_at(why, None)
+    }
+
+    /// Like `save`, dated `when` (seconds) rather than now: work brought in from the Hub
+    /// keeps the time it was made there. The date is kept between the entry before and
+    /// now, so the history always runs forward and "go back to Tuesday" stays right.
+    pub fn save_at(&mut self, why: &Why, when: Option<i64>) -> Result<Option<SaveReport>> {
+        // Work from the Hub being written into the folder is saved by whoever writes it.
+        crate::hub::wait_while_receiving(&self.root);
+        let now = chrono::Utc::now().timestamp();
         self.identity(); // load (or create) the signing key before taking the lock
         // Take the write lock first, so two saves can't both build on the same head.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let ts = match when {
+            None => now,
+            Some(t) => {
+                let last: i64 = tx.query_row("SELECT COALESCE(MAX(ts), 0) FROM timeline", [], |r| r.get(0))?;
+                t.min(now).max(last.min(now))
+            }
+        };
         let prev = self.head()?;
         let old = match &prev {
             Some((_, _, m)) => Self::decode_manifest(&self.get_blob(m)?)?,
@@ -1345,6 +1363,27 @@ impl Store {
     /// Makes the files in `dir` match `want` for the paths listed in `changes`
     /// (added/modified are written, deleted are removed).
     pub(crate) fn apply(&self, dir: &Path, changes: &Changes, want: &Manifest) -> Result<()> {
+        // Every write into a project shared on the Hub that touches an ignore-rule file
+        // (from the Hub, a kept Try, undo or going back) is checked: files the new rules
+        // stop ignoring (`.env`, keys) are held back, never saved or sent.
+        let rules_change = dir == self.root
+            && changes.added.iter().chain(&changes.modified).chain(&changes.deleted).any(|p| scan::is_rule_file(p))
+            && crate::hub::link(&self.root).is_some();
+        let ignored_before = if rules_change { scan::walk_ignored(dir)? } else { Vec::new() };
+        self.write_changes(dir, changes, want)?;
+        if !ignored_before.is_empty() {
+            let held = scan::hold_back_freed(dir, ignored_before, want)?;
+            self.newly_held.borrow_mut().extend(held);
+        }
+        Ok(())
+    }
+
+    /// Files this run's writes held back from the Hub (each said once).
+    pub fn take_newly_held(&self) -> Vec<String> {
+        std::mem::take(&mut *self.newly_held.borrow_mut())
+    }
+
+    fn write_changes(&self, dir: &Path, changes: &Changes, want: &Manifest) -> Result<()> {
         refuse_linked_folder(dir)?;
         // Never overwrite or remove a big file that's left out of the history (one the
         // latest entry doesn't hold): its current version would be lost.

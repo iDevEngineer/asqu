@@ -19,7 +19,7 @@ fn definitions_export_in_both_formats() {
         ["asqu_status", "asqu_log", "asqu_save", "asqu_set_intent", "asqu_undo", "asqu_back",
          "asqu_mark", "asqu_show", "asqu_summary",
          "asqu_try_start", "asqu_try_list", "asqu_try_keep", "asqu_try_toss", "asqu_try_reopen", "asqu_try_compare",
-         "asqu_try_update"]
+         "asqu_try_update", "asqu_brief", "asqu_note"]
     );
     assert_eq!(openai[0]["type"], "function");
     assert_eq!(openai[5]["function"]["parameters"]["required"][0], "when");

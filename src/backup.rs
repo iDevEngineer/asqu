@@ -852,9 +852,9 @@ pub fn run_auto(root: &Path) -> Result<()> {
                 if wait > 0 {
                     std::thread::sleep(Duration::from_millis(wait as u64));
                 }
-                let store = Store::open_at(root)?;
+                let mut store = Store::open_at(root)?;
                 let mut failed = back_up_all(&store).iter().any(|(_, r)| r.is_err());
-                failed |= crate::hub::sync_and_record(&store).is_some_and(|r| r.is_err());
+                failed |= crate::hub::sync_and_record(&mut store).is_some_and(|r| r.is_err());
                 if failed {
                     break; // try again on the next change, not in a tight loop
                 }
